@@ -15,6 +15,9 @@ pub enum Error {
     #[error("logging is already initialized")]
     LoggingAlreadyInitialized,
 
+    #[error("network error: {0}")]
+    Network(#[from] crate::network::NetworkError),
+
     #[error("failed to install shutdown handler: {0}")]
     ShutdownHandler(String),
 }

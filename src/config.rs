@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -8,12 +9,20 @@ use crate::error::{Error, Result};
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub name: String,
     pub motd: String,
+    #[serde(default = "default_max_players")]
+    pub max_players: u32,
+}
+
+fn default_max_players() -> u32 {
+    20
 }
 
 impl Default for ServerConfig {
@@ -21,7 +30,45 @@ impl Default for ServerConfig {
         Self {
             name: "FeatherMC".to_owned(),
             motd: "A FeatherMC Server".to_owned(),
+            max_players: default_max_players(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    #[serde(default = "default_listen_address")]
+    pub address: String,
+    #[serde(default = "default_java_port")]
+    pub java_port: u16,
+}
+
+fn default_listen_address() -> String {
+    "0.0.0.0".to_owned()
+}
+
+fn default_java_port() -> u16 {
+    25565
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            address: default_listen_address(),
+            java_port: default_java_port(),
+        }
+    }
+}
+
+impl NetworkConfig {
+    pub fn socket_addr(&self) -> Result<SocketAddr> {
+        let ip: IpAddr = self.address.parse().map_err(|_| {
+            Error::InvalidConfig(format!(
+                "network.address {:?} is not a valid IP",
+                self.address
+            ))
+        })?;
+        Ok(SocketAddr::new(ip, self.java_port))
     }
 }
 
@@ -66,6 +113,21 @@ impl Config {
         if self.server.motd.len() > 256 {
             return Err(Error::InvalidConfig(
                 "server.motd must be at most 256 characters".to_owned(),
+            ));
+        }
+        if self.server.max_players == 0 {
+            return Err(Error::InvalidConfig(
+                "server.max_players must not be 0".to_owned(),
+            ));
+        }
+        if self.network.address.parse::<IpAddr>().is_err() {
+            return Err(Error::InvalidConfig(
+                "network.address must be a valid IP address".to_owned(),
+            ));
+        }
+        if self.network.java_port == 0 {
+            return Err(Error::InvalidConfig(
+                "network.java_port must not be 0".to_owned(),
             ));
         }
         Ok(())
@@ -113,7 +175,9 @@ mod tests {
             server: ServerConfig {
                 name: "   ".to_owned(),
                 motd: "Hi".to_owned(),
+                max_players: 20,
             },
+            network: NetworkConfig::default(),
         };
         assert!(config.validate().is_err());
     }
@@ -124,5 +188,41 @@ mod tests {
         let path = tmp.path().join("server.toml");
         std::fs::write(&path, "[server\nname = ").unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn default_network_config_listens_on_java_port() {
+        let network = NetworkConfig::default();
+        assert_eq!(network.address, "0.0.0.0");
+        assert_eq!(network.java_port, 25565);
+        assert_eq!(
+            network.socket_addr().unwrap(),
+            "0.0.0.0:25565".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn old_config_without_network_section_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("server.toml");
+        std::fs::write(&path, "[server]\nname = \"Custom\"\nmotd = \"Hi\"\n").unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.network, NetworkConfig::default());
+    }
+
+    #[test]
+    fn rejects_invalid_network_settings() {
+        let mut config = Config::default();
+        config.network.address = "not-an-ip".to_owned();
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.network.java_port = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.server.max_players = 0;
+        assert!(config.validate().is_err());
     }
 }

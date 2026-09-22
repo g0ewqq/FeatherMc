@@ -5,7 +5,10 @@ use tracing::{error, info};
 
 use crate::console::{self, ConsoleCommand, Event};
 use crate::error::{Error, Result};
-use crate::{Clock, Config, RuntimeDirs, Scheduler, SharedState, State};
+use crate::java::{JavaHandler, ServerStatus};
+use crate::{
+    Clock, Config, NetworkManager, RuntimeDirs, Scheduler, SharedState, State, WorldManager,
+};
 
 const STATUS_INTERVAL_TICKS: u64 = 200;
 
@@ -15,17 +18,24 @@ pub struct Server {
     state: SharedState,
     clock: Clock,
     scheduler: Scheduler,
+    network: NetworkManager,
+    java: JavaHandler,
+    worlds: WorldManager,
 }
 
 impl Server {
     #[must_use]
     pub fn new(config: Config, dirs: RuntimeDirs) -> Self {
+        let status = ServerStatus::from_config(&config);
         Self {
             config,
             dirs,
             state: SharedState::new(State::Created),
             clock: Clock::new(),
             scheduler: Scheduler::new(),
+            network: NetworkManager::new(),
+            java: JavaHandler::new(status),
+            worlds: WorldManager::create_default(),
         }
     }
 
@@ -41,6 +51,20 @@ impl Server {
 
     pub fn scheduler(&mut self) -> &mut Scheduler {
         &mut self.scheduler
+    }
+
+    #[must_use]
+    pub fn network(&self) -> &NetworkManager {
+        &self.network
+    }
+
+    #[must_use]
+    pub fn worlds(&self) -> &WorldManager {
+        &self.worlds
+    }
+
+    pub fn worlds_mut(&mut self) -> &mut WorldManager {
+        &mut self.worlds
     }
 
     pub fn run(self) -> Result<()> {
@@ -60,6 +84,11 @@ impl Server {
         );
         info!("Using working directory \"{}\"", self.dirs.base.display());
 
+        info!("Starting network");
+        let addr = self.config.network.socket_addr()?;
+        self.network.bind(addr)?;
+        info!("Listening on {addr}");
+
         self.scheduler.run_every(STATUS_INTERVAL_TICKS, |tick| {
             info!("Server tick {tick}");
         });
@@ -72,6 +101,12 @@ impl Server {
             let started = Instant::now();
             let tick = self.clock.advance();
             self.scheduler.tick(tick);
+            self.network.poll();
+            self.java.pump(&mut self.network, tick);
+            self.java.tick_physics(&mut self.network, &self.worlds);
+            self.java.pump_chunks(&mut self.network, &mut self.worlds);
+            self.java.pump_visibility(&mut self.network);
+            self.java.pump_blocks(&mut self.network, &mut self.worlds);
             self.clock.record(started.elapsed());
 
             match events.recv_timeout(self.clock.target().saturating_sub(started.elapsed())) {
@@ -97,6 +132,7 @@ impl Server {
         state = State::Stopping;
         self.state.set(state);
         info!(?state, "Stopping {}", crate::version::NAME);
+        self.network.shutdown();
 
         state = State::Stopped;
         self.state.set(state);
@@ -126,7 +162,14 @@ mod tests {
 
     fn test_server() -> (tempfile::TempDir, Server) {
         let tmp = tempfile::tempdir().unwrap();
-        let server = Server::new(Config::default(), RuntimeDirs::new(tmp.path()));
+        let config = Config {
+            network: crate::config::NetworkConfig {
+                address: "127.0.0.1".to_owned(),
+                java_port: 0,
+            },
+            ..Config::default()
+        };
+        let server = Server::new(config, RuntimeDirs::new(tmp.path()));
         (tmp, server)
     }
 

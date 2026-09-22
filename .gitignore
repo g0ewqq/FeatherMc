@@ -1,0 +1,8 @@
+/target/
+config/server.toml
+logs/*
+!logs/.gitkeep
+worlds/*
+!worlds/.gitkeep
+plugins/*
+!plugins/.gitkeep
