@@ -599,6 +599,10 @@ impl JavaHandler {
                 continue;
             };
             let teleport_id = session.teleport_id;
+            debug!(
+                "connection {id} position corrected to ({:.2}, {:.2}, {:.2})",
+                player.x, player.y, player.z
+            );
             send_response(
                 conn,
                 &encode_sync_position(
@@ -635,7 +639,9 @@ impl JavaHandler {
         if collides(world, player.x, player.y, player.z) {
             player.x = session.sim_x;
             player.z = session.sim_z;
-            correct = true;
+            if (player.x - before.0).hypot(player.z - before.2) > CORRECTION_THRESHOLD {
+                correct = true;
+            }
         }
         player.vx = player.x - session.sim_x;
         player.vz = player.z - session.sim_z;
