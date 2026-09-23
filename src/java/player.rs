@@ -1,4 +1,5 @@
 use crate::entity::{Entity, EntityLifecycle};
+use crate::inventory::{Inventory, ItemStack};
 use crate::java::metadata::{FLAG_SNEAKING, FLAG_SPRINTING, POSE_CROUCHING, POSE_STANDING};
 use crate::network::ConnectionId;
 
@@ -39,6 +40,8 @@ pub struct PlayerSession {
     pub on_ground: bool,
     pub sneaking: bool,
     pub sprinting: bool,
+    pub inventory: Inventory,
+    pub cursor: ItemStack,
 }
 
 impl PlayerSession {
@@ -72,7 +75,14 @@ impl PlayerSession {
             on_ground: false,
             sneaking: false,
             sprinting: false,
+            inventory: Inventory::starting(),
+            cursor: ItemStack::empty(),
         }
+    }
+
+    #[must_use]
+    pub fn held_item(&self) -> ItemStack {
+        self.inventory.held()
     }
 
     #[must_use]

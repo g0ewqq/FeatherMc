@@ -20,6 +20,7 @@ pub struct TcpTransport {
 impl TcpTransport {
     pub fn new(stream: TcpStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
+        stream.set_nodelay(true)?;
         Ok(Self { stream })
     }
 }

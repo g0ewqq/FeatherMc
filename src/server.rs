@@ -107,6 +107,7 @@ impl Server {
             self.java.pump_chunks(&mut self.network, &mut self.worlds);
             self.java.pump_visibility(&mut self.network);
             self.java.pump_blocks(&mut self.network, &mut self.worlds);
+            self.java.pump_inventory(&mut self.network);
             self.clock.record(started.elapsed());
 
             match events.recv_timeout(self.clock.target().saturating_sub(started.elapsed())) {

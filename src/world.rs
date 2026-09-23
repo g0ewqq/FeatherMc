@@ -240,12 +240,13 @@ impl Chunk {
                 Block::Dirt
             } else {
                 Block::Stone
-            };
+            } as u16;
             let section = (y - WORLD_MIN_Y) as usize / SECTION_SIZE as usize;
             let local_y = (y - WORLD_MIN_Y) as u8 % SECTION_SIZE as u8;
             for lx in 0..16u8 {
                 for lz in 0..16u8 {
-                    self.sections[section].set_local(lx, local_y, lz, block);
+                    let index = ChunkSection::index(lx, local_y, lz);
+                    self.sections[section].blocks[index] = block;
                 }
             }
         }

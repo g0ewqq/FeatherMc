@@ -1,6 +1,7 @@
 use super::error::ProtoError;
 use super::player::PlayerSession;
 use super::proto::{Reader, Writer};
+use crate::inventory::{ItemStack, INVENTORY_SIZE};
 
 pub const DUPLICATE_LOGIN_REASON: &str = "You logged in from another location.";
 
@@ -194,6 +195,48 @@ pub fn encode_block_update(x: i32, y: i32, z: i32, state: i32) -> Vec<u8> {
     body.write_position(x, y, z);
     body.write_varint(state);
     encode_packet(0x08, &body.into_bytes())
+}
+
+pub fn write_slot(writer: &mut Writer, stack: ItemStack) {
+    if stack.is_empty() {
+        writer.write_varint(0);
+        return;
+    }
+    writer.write_varint(stack.count as i32);
+    writer.write_varint(stack.item.id());
+    writer.write_varint(0);
+    writer.write_varint(0);
+}
+
+pub fn encode_container_content(
+    slots: &[ItemStack; INVENTORY_SIZE],
+    cursor: ItemStack,
+    state: i32,
+) -> Vec<u8> {
+    let mut body = Writer::new();
+    body.write_varint(0);
+    body.write_varint(state);
+    body.write_varint(INVENTORY_SIZE as i32);
+    for slot in slots.iter() {
+        write_slot(&mut body, *slot);
+    }
+    write_slot(&mut body, cursor);
+    encode_packet(0x12, &body.into_bytes())
+}
+
+pub fn encode_container_slot(window: i32, state: i32, index: i32, stack: ItemStack) -> Vec<u8> {
+    let mut body = Writer::new();
+    body.write_varint(window);
+    body.write_varint(state);
+    body.write_i16(index as i16);
+    write_slot(&mut body, stack);
+    encode_packet(0x14, &body.into_bytes())
+}
+
+pub fn encode_held_slot(index: u8) -> Vec<u8> {
+    let mut body = Writer::new();
+    body.write_varint(i32::from(index));
+    encode_packet(0x69, &body.into_bytes())
 }
 
 pub fn encode_block_changed_ack(sequence: i32) -> Vec<u8> {
@@ -462,6 +505,89 @@ mod tests {
         let mut reader = Reader::new(&bytes[header..header + len as usize]);
         assert_eq!(reader.read_varint().unwrap(), 0x04);
         assert_eq!(reader.read_varint().unwrap(), 41);
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn slots_encode_empty_and_full() {
+        let mut writer = Writer::new();
+        write_slot(&mut writer, ItemStack::empty());
+        assert_eq!(writer.into_bytes(), vec![0x00]);
+
+        let mut writer = Writer::new();
+        write_slot(
+            &mut writer,
+            ItemStack::new(crate::inventory::Item::Dirt, 5).unwrap(),
+        );
+        let bytes = writer.into_bytes();
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.read_varint().unwrap(), 5);
+        assert_eq!(
+            reader.read_varint().unwrap(),
+            crate::inventory::Item::Dirt.id()
+        );
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn container_and_held_packets_encode() {
+        let mut slots = [ItemStack::empty(); crate::inventory::INVENTORY_SIZE];
+        slots[36] = ItemStack::new(crate::inventory::Item::Stone, 64).unwrap();
+        let cursor = ItemStack::new(crate::inventory::Item::Dirt, 7).unwrap();
+        let bytes = encode_container_content(&slots, cursor, 3);
+        let (len, header) = decode_varint_prefix(&bytes).unwrap().unwrap();
+        let mut reader = Reader::new(&bytes[header..header + len as usize]);
+        assert_eq!(reader.read_varint().unwrap(), 0x12);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.read_varint().unwrap(), 3);
+        assert_eq!(
+            reader.read_varint().unwrap(),
+            crate::inventory::INVENTORY_SIZE as i32
+        );
+        for index in 0..crate::inventory::INVENTORY_SIZE {
+            let count = reader.read_varint().unwrap();
+            if index == 36 {
+                assert_eq!(count, 64);
+                assert_eq!(
+                    reader.read_varint().unwrap(),
+                    crate::inventory::Item::Stone.id()
+                );
+                assert_eq!(reader.read_varint().unwrap(), 0);
+                assert_eq!(reader.read_varint().unwrap(), 0);
+            } else {
+                assert_eq!(count, 0);
+            }
+        }
+        assert_eq!(reader.read_varint().unwrap(), 7);
+        assert_eq!(
+            reader.read_varint().unwrap(),
+            crate::inventory::Item::Dirt.id()
+        );
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.remaining(), 0);
+
+        let bytes = encode_container_slot(0, 4, 37, slots[36]);
+        let (len, header) = decode_varint_prefix(&bytes).unwrap().unwrap();
+        let mut reader = Reader::new(&bytes[header..header + len as usize]);
+        assert_eq!(reader.read_varint().unwrap(), 0x14);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.read_varint().unwrap(), 4);
+        assert_eq!(reader.read_i16().unwrap(), 37);
+        assert_eq!(reader.read_varint().unwrap(), 64);
+        assert_eq!(
+            reader.read_varint().unwrap(),
+            crate::inventory::Item::Stone.id()
+        );
+        assert_eq!(reader.remaining(), 2);
+
+        let bytes = encode_held_slot(8);
+        let (len, header) = decode_varint_prefix(&bytes).unwrap().unwrap();
+        let mut reader = Reader::new(&bytes[header..header + len as usize]);
+        assert_eq!(reader.read_varint().unwrap(), 0x69);
+        assert_eq!(reader.read_varint().unwrap(), 8);
         assert_eq!(reader.remaining(), 0);
     }
 

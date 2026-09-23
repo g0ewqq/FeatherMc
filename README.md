@@ -110,13 +110,16 @@ java_port = 25565
   sneak/sprint states, despawn on disconnect or range
 - Block breaking and placing with reach checks, dirty-section tracking
   and updates broadcast to nearby viewers
+- Item and inventory foundation: validated stacks, 46-slot inventory with
+  hotbar selection, starting items, click/drag/shift handling with
+  state-ID validation, container sync, held-item-driven placement
 - Full NBT reader/writer, TOML config, structured logging
 
 ## Known limitations
 
-Single flat world, no disk persistence, placing always puts stone
-(no inventory yet), full-bright lighting, default skins, no mobs, combat,
-redstone, fluids or plugins.
+Single flat world, no disk persistence, placing uses the held hotbar
+item, full-bright lighting, default skins, no mobs, combat, redstone,
+fluids or plugins.
 
 ## Project layout
 

@@ -15,10 +15,10 @@ use super::error::ProtoError;
 use super::metadata::player_metadata;
 use super::packets::{
     decode_handshake, decode_login_start, encode_block_changed_ack, encode_block_update,
-    encode_default_spawn, encode_finish_configuration, encode_game_event, encode_keep_alive,
-    encode_known_packs, encode_login_disconnect, encode_login_success, encode_play_login,
-    encode_pong, encode_status_response, encode_sync_position, encode_update_tags,
-    DUPLICATE_LOGIN_REASON,
+    encode_container_content, encode_default_spawn, encode_finish_configuration, encode_game_event,
+    encode_held_slot, encode_keep_alive, encode_known_packs, encode_login_disconnect,
+    encode_login_success, encode_play_login, encode_pong, encode_status_response,
+    encode_sync_position, encode_update_tags, DUPLICATE_LOGIN_REASON,
 };
 use super::player::PlayerSession;
 use super::proto::{decode_varint_prefix, Reader};
@@ -26,6 +26,7 @@ use super::registries::{default_registries, encode_registry_data};
 use super::registry::PlayerRegistry;
 use super::state::ProtocolState;
 use crate::config::Config;
+use crate::inventory::{Inventory, ItemStack};
 use crate::network::{Connection, ConnectionId, NetworkManager};
 use crate::world::{Block, ChunkPos, World, WorldManager, DEFAULT_WORLD_NAME};
 
@@ -175,6 +176,10 @@ pub struct JavaSession {
     sim_z: f64,
     tracked: HashMap<ConnectionId, TrackedPose>,
     edits: Vec<PendingEdit>,
+    clicks: Vec<PendingClick>,
+    inv_dirty: bool,
+    held_dirty: bool,
+    inv_state: i32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +197,39 @@ enum PendingEdit {
         face: i32,
         sequence: i32,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingClick {
+    window: i32,
+    state: i32,
+    slot: i32,
+    button: u8,
+    mode: i32,
+}
+
+fn read_hashed_slot(reader: &mut Reader) -> Result<(), ProtoError> {
+    if !reader.read_bool()? {
+        return Ok(());
+    }
+    reader.read_varint()?;
+    reader.read_varint()?;
+    let added = reader.read_varint()?;
+    if added < 0 {
+        return Err(ProtoError::NegativeLength(added));
+    }
+    for _ in 0..added {
+        reader.read_varint()?;
+        reader.read_i32()?;
+    }
+    let removed = reader.read_varint()?;
+    if removed < 0 {
+        return Err(ProtoError::NegativeLength(removed));
+    }
+    for _ in 0..removed {
+        reader.read_varint()?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +257,10 @@ impl JavaSession {
             sim_z: crate::world::SPAWN_Z,
             tracked: HashMap::new(),
             edits: Vec::new(),
+            clicks: Vec::new(),
+            inv_dirty: false,
+            held_dirty: false,
+            inv_state: 0,
         }
     }
 
@@ -302,6 +344,21 @@ impl JavaHandler {
                 Some(PacketAction::Edit(edit)) => {
                     if let Some(session) = self.sessions.get_mut(&id) {
                         session.edits.push(edit);
+                    }
+                }
+                Some(PacketAction::SelectSlot(index)) => {
+                    if let Some(player) = self.players.get_mut(id) {
+                        player.inventory.select(index);
+                    }
+                }
+                Some(PacketAction::HeldEcho) => {
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        session.held_dirty = true;
+                    }
+                }
+                Some(PacketAction::Click(click)) => {
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        session.clicks.push(click);
                     }
                 }
                 Some(PacketAction::MovePlayer {
@@ -671,6 +728,7 @@ impl JavaHandler {
             Some(player) => player.clone(),
             None => return,
         };
+        let held = player.held_item();
         let (target, block, sequence) = match edit {
             PendingEdit::Break { x, y, z, sequence } => ((x, y, z), Block::Air, sequence),
             PendingEdit::Place {
@@ -679,10 +737,13 @@ impl JavaHandler {
                 z,
                 face,
                 sequence,
-            } => {
-                let (ox, oy, oz) = FACE_OFFSETS[face as usize];
-                ((x + ox, y + oy, z + oz), Block::Stone, sequence)
-            }
+            } => match held.item.block() {
+                Some(block) if !held.is_empty() => {
+                    let (ox, oy, oz) = FACE_OFFSETS[face as usize];
+                    ((x + ox, y + oy, z + oz), block, sequence)
+                }
+                _ => return,
+            },
         };
         let eyes = (player.x, player.y + 1.62, player.z);
         let center = (
@@ -697,22 +758,35 @@ impl JavaHandler {
             return;
         };
         let current = world.get_block(target.0, target.1, target.2);
-        let allowed = dist <= BLOCK_REACH
-            && world.is_chunk_loaded(ChunkPos::from_world(target.0, target.2))
-            && match (edit, current) {
-                (PendingEdit::Break { .. }, Some(existing)) => existing.is_solid(),
-                (PendingEdit::Place { .. }, Some(Block::Air)) => {
-                    let (fx, fy, fz) = (
-                        player.x.floor() as i32,
-                        player.y.floor() as i32,
-                        player.z.floor() as i32,
-                    );
-                    (target.0, target.1, target.2) != (fx, fy, fz)
-                        && (target.0, target.1, target.2) != (fx, fy + 1, fz)
-                }
-                _ => false,
-            };
+        let loaded = world.is_chunk_loaded(ChunkPos::from_world(target.0, target.2));
+        if dist > BLOCK_REACH {
+            debug!("connection {id} edit out of reach (dist {dist:.1}): {edit:?}");
+            return;
+        }
+        if !loaded {
+            debug!("connection {id} edit in unloaded chunk: {edit:?}");
+            return;
+        }
+        let allowed = match (edit, current) {
+            (PendingEdit::Break { .. }, Some(existing)) => existing.is_solid(),
+            (PendingEdit::Place { .. }, Some(Block::Air)) => {
+                let (fx, fy, fz) = (
+                    player.x.floor() as i32,
+                    player.y.floor() as i32,
+                    player.z.floor() as i32,
+                );
+                (target.0, target.1, target.2) != (fx, fy, fz)
+                    && (target.0, target.1, target.2) != (fx, fy + 1, fz)
+            }
+            _ => false,
+        };
         if !allowed {
+            if let (Some(current), Some(conn)) = (current, network.connection_mut(id)) {
+                send_response(
+                    conn,
+                    &encode_block_update(target.0, target.1, target.2, block_to_state(current)),
+                );
+            }
             return;
         }
         let changed = world
@@ -720,6 +794,23 @@ impl JavaHandler {
             .is_some();
         if !changed {
             return;
+        }
+        info!(
+            "Player {} set ({}, {}, {}) to {}",
+            player.name,
+            target.0,
+            target.1,
+            target.2,
+            block.name()
+        );
+        if matches!(edit, PendingEdit::Place { .. }) {
+            if let Some(player) = self.players.get_mut(id) {
+                let held_index = player.inventory.selected_slot_index();
+                player.inventory.consume_one(held_index);
+            }
+            if let Some(session) = self.sessions.get_mut(&id) {
+                session.inv_dirty = true;
+            }
         }
         let chunk = ChunkPos::from_world(target.0, target.2);
         if let Some(stored) = world.get_chunk_mut(chunk) {
@@ -745,6 +836,83 @@ impl JavaHandler {
             if let Some(conn) = network.connection_mut(viewer) {
                 send_response(conn, &packet);
             }
+        }
+    }
+
+    pub fn pump_inventory(&mut self, network: &mut NetworkManager) {
+        let clickers: Vec<(ConnectionId, Vec<PendingClick>)> = self
+            .sessions
+            .iter_mut()
+            .filter(|(_, session)| session.state == ProtocolState::Play)
+            .filter(|(_, session)| !session.clicks.is_empty())
+            .map(|(id, session)| (*id, std::mem::take(&mut session.clicks)))
+            .collect();
+        for (id, clicks) in clickers {
+            for click in clicks {
+                self.apply_click(id, click);
+            }
+        }
+        let ids: Vec<ConnectionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.state == ProtocolState::Play)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let (Some(session), Some(conn), Some(player)) = (
+                self.sessions.get_mut(&id),
+                network.connection_mut(id),
+                self.players.get(id),
+            ) else {
+                continue;
+            };
+            if session.inv_dirty {
+                session.inv_state += 1;
+                let mut slots = [ItemStack::empty(); crate::inventory::INVENTORY_SIZE];
+                for (index, slot) in slots.iter_mut().enumerate() {
+                    *slot = player.inventory.get(index).unwrap_or(ItemStack::empty());
+                }
+                send_response(
+                    conn,
+                    &encode_container_content(&slots, player.cursor, session.inv_state),
+                );
+                session.inv_dirty = false;
+            }
+            if session.held_dirty {
+                send_response(conn, &encode_held_slot(player.inventory.selected()));
+                session.held_dirty = false;
+            }
+            if conn.is_closed() {
+                self.remove_session(id);
+            }
+        }
+    }
+
+    fn apply_click(&mut self, id: ConnectionId, click: PendingClick) {
+        let (Some(session), Some(player)) = (self.sessions.get_mut(&id), self.players.get_mut(id))
+        else {
+            return;
+        };
+        if click.window != 0 {
+            return;
+        }
+        if click.state != session.inv_state {
+            session.inv_dirty = true;
+            return;
+        }
+        let applied = match click.mode {
+            0 => click_pickup(
+                &mut player.inventory,
+                &mut player.cursor,
+                click.slot,
+                click.button,
+            ),
+            1 => click_shift(&mut player.inventory, click.slot),
+            2 => click_swap(&mut player.inventory, click.slot, click.button),
+            _ => false,
+        };
+        if applied {
+            session.inv_dirty = true;
         }
     }
 
@@ -927,6 +1095,7 @@ impl JavaHandler {
         }
         session.teleport_id += 1;
         session.state = ProtocolState::Play;
+        session.inv_dirty = true;
         info!("Player joined: {}", player.name);
     }
 }
@@ -962,6 +1131,9 @@ enum PacketAction {
     EnterPlay,
     PlayerAction(i32),
     Edit(PendingEdit),
+    SelectSlot(u8),
+    HeldEcho,
+    Click(PendingClick),
     MovePlayer {
         x: f64,
         y: f64,
@@ -1123,6 +1295,19 @@ fn handle_packet(
                 session.id
             );
         }
+        (ProtocolState::Play, 0x35) => {
+            let mut reader = Reader::new(payload);
+            if let Ok(slot) = reader.read_i16() {
+                if reader.remaining() == 0 && (0..=8).contains(&slot) {
+                    return Ok(PacketAction::SelectSlot(slot as u8));
+                }
+            }
+            debug!(
+                "connection {} held slot out of range, echoing current",
+                session.id
+            );
+            return Ok(PacketAction::HeldEcho);
+        }
         (ProtocolState::Play, 0x29) => {
             let mut reader = Reader::new(payload);
             if let (Ok(status), Ok(pos), Ok(face), Ok(sequence)) = (
@@ -1131,7 +1316,7 @@ fn handle_packet(
                 reader.read_varint(),
                 reader.read_varint(),
             ) {
-                if reader.remaining() == 0 && status == 2 && (0..=5).contains(&face) {
+                if status == 2 && (0..=5).contains(&face) {
                     return Ok(PacketAction::Edit(PendingEdit::Break {
                         x: pos.0,
                         y: pos.1,
@@ -1160,7 +1345,7 @@ fn handle_packet(
                     reader.read_bool(),
                     reader.read_varint(),
                 ) {
-                    if reader.remaining() == 0 && (0..=5).contains(&face) {
+                    if (0..=5).contains(&face) {
                         return Ok(PacketAction::Edit(PendingEdit::Place {
                             x: pos.0,
                             y: pos.1,
@@ -1173,6 +1358,41 @@ fn handle_packet(
             }
             debug!(
                 "connection {} play packet 0x42 with unexpected shape tolerated",
+                session.id
+            );
+        }
+        (ProtocolState::Play, 0x12) => {
+            let mut reader = Reader::new(payload);
+            if let (Ok(window), Ok(state), Ok(slot), Ok(button), Ok(mode)) = (
+                reader.read_varint(),
+                reader.read_varint(),
+                reader.read_i16(),
+                reader.read_u8(),
+                reader.read_varint(),
+            ) {
+                let count = reader.read_varint().unwrap_or(-1);
+                let mut ok = count >= 0 && reader.remaining() > 0;
+                for _ in 0..count.max(0) {
+                    if reader.read_i16().is_err() || read_hashed_slot(&mut reader).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    ok = read_hashed_slot(&mut reader).is_ok() && reader.remaining() == 0;
+                }
+                if ok && (0..=6).contains(&mode) {
+                    return Ok(PacketAction::Click(PendingClick {
+                        window,
+                        state,
+                        slot: i32::from(slot),
+                        button,
+                        mode,
+                    }));
+                }
+            }
+            debug!(
+                "connection {} container click with unexpected shape tolerated",
                 session.id
             );
         }
@@ -1207,6 +1427,189 @@ fn collides(world: &World, x: f64, y: f64, z: f64) -> bool {
             Some(block) if block.is_solid()
         )
     })
+}
+
+fn click_pickup(inventory: &mut Inventory, cursor: &mut ItemStack, slot: i32, button: u8) -> bool {
+    if slot == -999 || !(0..crate::inventory::INVENTORY_SIZE as i32).contains(&slot) {
+        return false;
+    }
+    let index = slot as usize;
+    match button {
+        0 => {
+            if cursor.is_empty() {
+                match inventory.take(index, u32::MAX) {
+                    Some(taken) => {
+                        *cursor = taken;
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                match inventory.get(index) {
+                    None => false,
+                    Some(current) if current.is_empty() => {
+                        inventory.set(index, *cursor);
+                        *cursor = ItemStack::empty();
+                        true
+                    }
+                    Some(current) if current.item == cursor.item => {
+                        let room = current.item.max_stack() - current.count;
+                        let take = room.min(cursor.count);
+                        if take == 0 {
+                            return false;
+                        }
+                        inventory.set(
+                            index,
+                            ItemStack {
+                                item: current.item,
+                                count: current.count + take,
+                            },
+                        );
+                        cursor.count -= take;
+                        if cursor.count == 0 {
+                            *cursor = ItemStack::empty();
+                        }
+                        true
+                    }
+                    Some(current) => {
+                        inventory.set(index, *cursor);
+                        *cursor = current;
+                        true
+                    }
+                }
+            }
+        }
+        1 => {
+            if cursor.is_empty() {
+                match inventory.get(index) {
+                    Some(current) if !current.is_empty() => {
+                        let half = current.count.div_ceil(2);
+                        match inventory.take(index, half) {
+                            Some(taken) => {
+                                *cursor = taken;
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                    _ => false,
+                }
+            } else {
+                match inventory.get(index) {
+                    None => false,
+                    Some(current) if current.is_empty() => {
+                        inventory.set(
+                            index,
+                            ItemStack {
+                                item: cursor.item,
+                                count: 1,
+                            },
+                        );
+                        cursor.count -= 1;
+                        if cursor.count == 0 {
+                            *cursor = ItemStack::empty();
+                        }
+                        true
+                    }
+                    Some(current)
+                        if current.item == cursor.item
+                            && current.count < current.item.max_stack() =>
+                    {
+                        inventory.set(
+                            index,
+                            ItemStack {
+                                item: current.item,
+                                count: current.count + 1,
+                            },
+                        );
+                        cursor.count -= 1;
+                        if cursor.count == 0 {
+                            *cursor = ItemStack::empty();
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+        }
+        _ => false,
+    }
+}
+
+fn click_shift(inventory: &mut Inventory, slot: i32) -> bool {
+    if !(0..crate::inventory::INVENTORY_SIZE as i32).contains(&slot) {
+        return false;
+    }
+    let index = slot as usize;
+    let (start, end) = if (9..36).contains(&index) {
+        (crate::inventory::HOTBAR_START, 45)
+    } else if (36..45).contains(&index) {
+        (9, 36)
+    } else {
+        return false;
+    };
+    let moving = match inventory.get(index) {
+        Some(stack) if !stack.is_empty() => stack,
+        _ => return false,
+    };
+    inventory.clear(index);
+    let mut rest = moving;
+    for target in start..end {
+        if rest.count == 0 {
+            break;
+        }
+        if let Some(current) = inventory.get(target) {
+            if current.item == rest.item && current.count < current.item.max_stack() {
+                let room = current.item.max_stack() - current.count;
+                let take = room.min(rest.count);
+                inventory.set(
+                    target,
+                    ItemStack {
+                        item: rest.item,
+                        count: current.count + take,
+                    },
+                );
+                rest.count -= take;
+            }
+        }
+    }
+    for target in start..end {
+        if rest.count == 0 {
+            break;
+        }
+        if inventory.get(target).is_some_and(|stack| stack.is_empty()) {
+            let take = rest.item.max_stack().min(rest.count);
+            inventory.set(
+                target,
+                ItemStack {
+                    item: rest.item,
+                    count: take,
+                },
+            );
+            rest.count -= take;
+        }
+    }
+    if rest.count > 0 {
+        inventory.set(index, rest);
+    }
+    true
+}
+
+fn click_swap(inventory: &mut Inventory, slot: i32, button: u8) -> bool {
+    if !(0..crate::inventory::INVENTORY_SIZE as i32).contains(&slot) {
+        return false;
+    }
+    let other = match button {
+        0..=8 => crate::inventory::HOTBAR_START + button as usize,
+        40 => 45,
+        _ => return false,
+    };
+    let index = slot as usize;
+    let first = inventory.get(index).unwrap_or(ItemStack::empty());
+    let second = inventory.get(other).unwrap_or(ItemStack::empty());
+    inventory.set(index, second);
+    inventory.set(other, first);
+    true
 }
 
 fn send_response(conn: &mut Connection, response: &[u8]) {
@@ -2511,14 +2914,19 @@ mod tests {
         send_dig(&mut first, 2, 0, 70, 0, 1, 1);
         settle(&mut stack);
         stack.1.pump_blocks(&mut stack.0, &mut worlds);
-        expect_silence(&mut first);
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x08);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_position().unwrap(), (0, 70, 0));
+        assert_eq!(reader.read_varint().unwrap(), 0);
 
         send_dig(&mut first, 2, 500, 64, 500, 1, 2);
         settle(&mut stack);
         stack.1.pump_blocks(&mut stack.0, &mut worlds);
         expect_silence(&mut first);
 
-        send_dig(&mut first, 2, 0, 64, 100, 1, 3);
+        stack.1.players.get_mut(1).unwrap().x = 100.0;
+        send_dig(&mut first, 2, 0, 64, 0, 1, 3);
         settle(&mut stack);
         stack.1.pump_blocks(&mut stack.0, &mut worlds);
         expect_silence(&mut first);
@@ -2563,12 +2971,20 @@ mod tests {
         send_place(&mut first, 0, 63, 0, 1, 12);
         settle(&mut stack);
         stack.1.pump_blocks(&mut stack.0, &mut worlds);
-        expect_silence(&mut first);
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x08);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_position().unwrap(), (0, 64, 0));
+        assert_eq!(reader.read_varint().unwrap(), 8);
 
         send_place(&mut first, 0, 67, 0, 1, 13);
         settle(&mut stack);
         stack.1.pump_blocks(&mut stack.0, &mut worlds);
-        expect_silence(&mut first);
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x08);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_position().unwrap(), (0, 68, 0));
+        assert_eq!(reader.read_varint().unwrap(), 0);
         assert_eq!(
             worlds
                 .get(crate::world::DEFAULT_WORLD_NAME)
@@ -2576,6 +2992,18 @@ mod tests {
                 .get_block(0, 68, 0),
             Some(crate::world::Block::Air)
         );
+
+        stack.1.pump_inventory(&mut stack.0);
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x12);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.read_varint().unwrap(), 1);
+        assert_eq!(reader.read_varint().unwrap(), 46);
+        for _ in 0..36 {
+            assert_eq!(reader.read_varint().unwrap(), 0);
+        }
+        assert_eq!(reader.read_varint().unwrap(), 63);
     }
 
     #[test]
@@ -2593,6 +3021,310 @@ mod tests {
         let (id, _) = first.read_packet();
         assert_eq!(id, 0x08);
         expect_silence(&mut second);
+    }
+
+    fn send_held(client: &mut ScriptClient, slot: i16) {
+        let mut body = Writer::new();
+        body.write_i16(slot);
+        client.send_packet(0x35, &body.into_bytes());
+    }
+
+    #[test]
+    fn held_slot_selects_and_rejects_safely() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        seed_visible(&mut stack, 1);
+
+        send_held(&mut first, 2);
+        settle(&mut stack);
+        assert_eq!(stack.1.players.get(1).unwrap().inventory.selected(), 2);
+        assert_eq!(
+            stack.1.players.get(1).unwrap().held_item().item,
+            crate::inventory::Item::GrassBlock
+        );
+        stack.1.pump_inventory(&mut stack.0);
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x12);
+        expect_silence(&mut first);
+
+        send_held(&mut first, 9);
+        settle(&mut stack);
+        assert_eq!(stack.1.players.get(1).unwrap().inventory.selected(), 2);
+        stack.1.pump_inventory(&mut stack.0);
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x69);
+        assert_eq!(Reader::new(&payload).read_varint().unwrap(), 2);
+    }
+
+    #[test]
+    fn initial_inventory_syncs_on_play_entry() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x12);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.read_varint().unwrap(), 1);
+        assert_eq!(reader.read_varint().unwrap(), 46);
+        let mut counts = Vec::new();
+        for _ in 0..46 {
+            let count = reader.read_varint().unwrap();
+            if count > 0 {
+                counts.push((count, reader.read_varint().unwrap()));
+                assert_eq!(reader.read_varint().unwrap(), 0);
+                assert_eq!(reader.read_varint().unwrap(), 0);
+            }
+        }
+        assert_eq!(
+            counts,
+            vec![
+                (64, crate::inventory::Item::Stone.id()),
+                (64, crate::inventory::Item::Dirt.id()),
+                (64, crate::inventory::Item::GrassBlock.id())
+            ]
+        );
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.remaining(), 0);
+
+        stack.1.pump_inventory(&mut stack.0);
+        expect_silence(&mut first);
+    }
+
+    #[test]
+    fn empty_hand_cannot_place() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        seed_visible(&mut stack, 1);
+        let mut worlds = lowered_worlds(&mut stack);
+
+        send_held(&mut first, 5);
+        settle(&mut stack);
+        assert!(stack.1.players.get(1).unwrap().held_item().is_empty());
+        send_place(&mut first, 0, 64, 0, 1, 31);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds);
+        expect_silence(&mut first);
+        assert_eq!(
+            worlds
+                .get(crate::world::DEFAULT_WORLD_NAME)
+                .unwrap()
+                .get_block(0, 65, 0),
+            Some(crate::world::Block::Air)
+        );
+        assert_eq!(
+            stack.1.players.get(1).unwrap().held_item(),
+            crate::inventory::ItemStack::empty()
+        );
+    }
+
+    fn write_hashed(body: &mut Writer, present: bool, id: i32, count: i32) {
+        body.write_bool(present);
+        if present {
+            body.write_varint(id);
+            body.write_varint(count);
+            body.write_varint(0);
+            body.write_varint(0);
+        }
+    }
+
+    fn send_click(
+        client: &mut ScriptClient,
+        window: i32,
+        state: i32,
+        slot: i16,
+        button: u8,
+        mode: i32,
+    ) {
+        let mut body = Writer::new();
+        body.write_varint(window);
+        body.write_varint(state);
+        body.write_i16(slot);
+        body.write_u8(button);
+        body.write_varint(mode);
+        body.write_varint(0);
+        write_hashed(&mut body, false, 0, 0);
+        client.send_packet(0x12, &body.into_bytes());
+    }
+
+    fn read_slot(reader: &mut Reader) -> (i32, i32) {
+        let count = reader.read_varint().unwrap();
+        if count > 0 {
+            let id = reader.read_varint().unwrap();
+            reader.read_varint().unwrap();
+            reader.read_varint().unwrap();
+            (count, id)
+        } else {
+            (0, -1)
+        }
+    }
+
+    fn read_content(client: &mut ScriptClient) -> (i32, Vec<(i32, i32)>, (i32, i32)) {
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x12);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        let state = reader.read_varint().unwrap();
+        assert_eq!(reader.read_varint().unwrap(), 46);
+        let mut slots = Vec::new();
+        for _ in 0..46 {
+            slots.push(read_slot(&mut reader));
+        }
+        let cursor = read_slot(&mut reader);
+        assert_eq!(reader.remaining(), 0);
+        (state, slots, cursor)
+    }
+
+    #[test]
+    fn click_pickup_and_place_with_cursor() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        let (state, _, _) = read_content(&mut first);
+        assert_eq!(state, 1);
+
+        send_click(&mut first, 0, 1, 36, 0, 0);
+        settle(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        let player = stack.1.players.get(1).unwrap();
+        assert_eq!(
+            player.cursor,
+            crate::inventory::ItemStack::new(crate::inventory::Item::Stone, 64).unwrap()
+        );
+        let (state, slots, cursor) = read_content(&mut first);
+        assert_eq!(state, 2);
+        assert_eq!(slots[36], (0, -1));
+        assert_eq!(cursor.0, 64);
+
+        send_click(&mut first, 0, 2, 9, 0, 0);
+        settle(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        let player = stack.1.players.get(1).unwrap();
+        assert!(player.cursor.is_empty());
+        let (state, slots, _) = read_content(&mut first);
+        assert_eq!(state, 3);
+        assert_eq!(slots[9].0, 64);
+
+        stack.1.pump_inventory(&mut stack.0);
+        expect_silence(&mut first);
+    }
+
+    #[test]
+    fn click_right_splits_and_places_single() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+
+        send_click(&mut first, 0, 1, 36, 1, 0);
+        settle(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        let player = stack.1.players.get(1).unwrap();
+        assert_eq!(player.cursor.count, 32);
+        assert_eq!(player.inventory.get(36).unwrap().count, 32);
+        read_content(&mut first);
+
+        send_click(&mut first, 0, 2, 9, 1, 0);
+        settle(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        let player = stack.1.players.get(1).unwrap();
+        assert_eq!(player.inventory.get(9).unwrap().count, 1);
+        assert_eq!(player.cursor.count, 31);
+    }
+
+    #[test]
+    fn click_shift_and_swap_move_stacks() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        stack.1.players.get_mut(1).unwrap().inventory.set(
+            9,
+            crate::inventory::ItemStack::new(crate::inventory::Item::Dirt, 10).unwrap(),
+        );
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+
+        send_click(&mut first, 0, 1, 9, 0, 1);
+        settle(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        let player = stack.1.players.get(1).unwrap();
+        assert_eq!(player.inventory.get(9).unwrap().count, 0);
+        assert_eq!(player.inventory.get(39).unwrap().count, 10);
+        read_content(&mut first);
+
+        send_click(&mut first, 0, 2, 9, 0, 2);
+        settle(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        let player = stack.1.players.get(1).unwrap();
+        assert_eq!(player.inventory.get(9).unwrap().count, 64);
+        assert!(player.inventory.get(36).unwrap().is_empty());
+    }
+
+    #[test]
+    fn throw_drag_and_clone_clicks_are_ignored() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+
+        send_click(&mut first, 0, 1, 36, 0, 4);
+        send_click(&mut first, 0, 1, 36, 0, 5);
+        send_click(&mut first, 0, 1, 36, 0, 6);
+        send_click(&mut first, 0, 1, 36, 0, 3);
+        settle(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        expect_silence(&mut first);
+        let player = stack.1.players.get(1).unwrap();
+        assert_eq!(player.inventory.get(36).unwrap().count, 64);
+        assert!(player.cursor.is_empty());
+    }
+
+    #[test]
+    fn stale_state_click_resyncs_without_applying() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+
+        send_click(&mut first, 0, 0, 36, 0, 0);
+        settle(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        let (state, slots, _) = read_content(&mut first);
+        assert_eq!(state, 2);
+        assert_eq!(slots[36].0, 64);
+        assert!(stack.1.players.get(1).unwrap().cursor.is_empty());
+    }
+
+    #[test]
+    fn wrong_window_click_is_ignored() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+
+        send_click(&mut first, 3, 1, 36, 0, 0);
+        settle(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        expect_silence(&mut first);
+        assert!(stack.1.players.get(1).unwrap().cursor.is_empty());
+    }
+
+    #[test]
+    fn malformed_click_is_tolerated() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        first.send_packet(0x12, &[0x00]);
+        let mut body = Writer::new();
+        body.write_varint(0);
+        body.write_varint(0);
+        body.write_i16(36);
+        body.write_u8(0);
+        body.write_varint(9);
+        body.write_varint(0);
+        write_hashed(&mut body, false, 0, 0);
+        first.send_packet(0x12, &body.into_bytes());
+        settle(&mut stack);
+        assert_eq!(stack.0.connection_count(), 1);
+        assert_eq!(stack.1.player_count(), 1);
     }
 
     #[test]
