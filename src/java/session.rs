@@ -38,6 +38,11 @@ use crate::world::{Block, ChunkPos, World, WorldManager, DEFAULT_WORLD_NAME};
 const MAX_PACKET_LEN: i32 = 2097151;
 const KEEPALIVE_INTERVAL_TICKS: u64 = 200;
 const MAX_MOVE_PER_PACKET: f64 = 12.0;
+/// New chunks streamed per player per tick (see `pump_chunks`).
+const CHUNKS_PER_TICK: usize = 4;
+/// Ticks without a keepalive answer before a play session is dropped.
+/// 600 ticks = 30 seconds at 20 TPS.
+const KEEPALIVE_TIMEOUT_TICKS: u64 = 600;
 const GRAVITY_PER_TICK: f64 = 0.08;
 const AIR_DRAG: f64 = 0.98;
 const TERMINAL_VELOCITY: f64 = -3.92;
@@ -206,6 +211,8 @@ pub struct JavaSession {
     abilities_dirty: bool,
     inv_state: i32,
     sent_state: Option<([ItemStack; crate::inventory::INVENTORY_SIZE], ItemStack)>,
+    keepalive_id: i64,
+    last_keepalive_ack: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -344,6 +351,8 @@ impl JavaSession {
             abilities_dirty: false,
             inv_state: 0,
             sent_state: None,
+            keepalive_id: 0,
+            last_keepalive_ack: None,
         }
     }
 
@@ -412,6 +421,20 @@ impl JavaHandler {
                 }
                 Some(PacketAction::EnterPlay) => {
                     self.enter_play(id, network);
+                    // Start the dead-client clock at play entry; refreshed
+                    // by every matching keepalive answer.
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        session.last_keepalive_ack = Some(tick);
+                    }
+                }
+                Some(PacketAction::KeepAliveAck(ack)) => {
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        // Stale answers (e.g. for an older challenge) must
+                        // not revive the clock.
+                        if ack == session.keepalive_id {
+                            session.last_keepalive_ack = Some(tick);
+                        }
+                    }
                 }
                 Some(PacketAction::PlayerAction(action)) => {
                     if let Some(player) = self.players.get_mut(id) {
@@ -518,6 +541,25 @@ impl JavaHandler {
                 return;
             }
         }
+        // Drop play sessions whose client stopped answering keepalives so
+        // dead connections cannot linger (and inflate player counts) until
+        // an OS-level timeout.
+        let keepalive_timed_out = matches!(
+            self.sessions.get(&id),
+            Some(session)
+                if session.state == ProtocolState::Play
+                    && session.last_keepalive_ack.is_some_and(|last| {
+                        tick.saturating_sub(last) > KEEPALIVE_TIMEOUT_TICKS
+                    })
+        );
+        if keepalive_timed_out {
+            debug!("connection {id} keepalive timeout, disconnecting");
+            if let Some(conn) = network.connection_mut(id) {
+                conn.close();
+            }
+            self.remove_session(id);
+            return;
+        }
         let (Some(session), Some(conn)) = (self.sessions.get_mut(&id), network.connection_mut(id))
         else {
             self.remove_session(id);
@@ -530,6 +572,7 @@ impl JavaHandler {
             session.config_stage = ConfigStage::KnownPacksSent;
         }
         if session.state == ProtocolState::Play && tick % KEEPALIVE_INTERVAL_TICKS == 0 {
+            session.keepalive_id = tick as i64;
             send_response(conn, &encode_keep_alive(tick as i64));
         }
         if session.state == ProtocolState::Play && session.abilities_dirty {
@@ -590,8 +633,22 @@ impl JavaHandler {
             }
             if let Some(old) = self.players.remove(old_id) {
                 info!("Player disconnected: {} (duplicate login)", old.name);
+                // Queue the tab-list removal like a normal disconnect so
+                // viewers don't keep a ghost entry (uuid may differ when the
+                // match was by name).
+                self.departed.push(old.display_uuid());
             }
             self.sessions.remove(&old_id);
+        }
+        // Vanilla behavior: a full server turns newcomers away instead of
+        // degrading for everyone. Duplicates above already freed their slot.
+        if self.players.len() >= self.status.max_players as usize {
+            debug!("connection {id} rejected: server full");
+            if let Some(conn) = network.connection_mut(id) {
+                send_response(conn, &encode_login_disconnect("Server is full!"));
+                conn.close();
+            }
+            return;
         }
         let version = self
             .sessions
@@ -636,69 +693,108 @@ impl JavaHandler {
         info!("Player login completed: {name}");
     }
 
+    /// Chunks streamed per tick per player. A full radius batch is 169
+    /// chunks (~10MB, ~1s of encoding on this hardware); trickling keeps
+    /// ticks near budget and lets the client render progressively instead
+    /// of stalling on one giant burst.
     pub fn pump_chunks(&mut self, network: &mut NetworkManager, worlds: &mut WorldManager) {
-        let pending: Vec<(ConnectionId, ChunkPos)> = self
+        let ids: Vec<ConnectionId> = self
             .sessions
             .iter()
             .filter(|(_, session)| session.state == ProtocolState::Play)
-            .filter_map(|(id, session)| {
-                let player = self.players.get(*id)?;
-                let center = ChunkPos::from_world(player.x.floor() as i32, player.z.floor() as i32);
-                if session.chunk_center == Some(center) {
-                    return None;
-                }
-                Some((*id, center))
-            })
+            .filter_map(|(id, _)| self.players.get(*id).map(|_| *id))
             .collect();
-        for (id, center) in pending {
-            let first = self
-                .sessions
-                .get(&id)
-                .map(|session| session.chunk_center.is_none())
-                .unwrap_or(false);
-            let Some(world) = worlds.get_mut(DEFAULT_WORLD_NAME) else {
-                continue;
-            };
-            let Some(conn) = network.connection_mut(id) else {
-                self.remove_session(id);
-                continue;
-            };
-            if first {
-                send_response(conn, &encode_game_event(13, 0.0));
+        for id in ids {
+            self.pump_chunks_one(id, network, worlds);
+        }
+    }
+
+    fn pump_chunks_one(
+        &mut self,
+        id: ConnectionId,
+        network: &mut NetworkManager,
+        worlds: &mut WorldManager,
+    ) {
+        let center = match self.players.get(id) {
+            Some(player) => ChunkPos::from_world(player.x.floor() as i32, player.z.floor() as i32),
+            None => return,
+        };
+        let mut desired = HashSet::new();
+        for dx in -CHUNK_RADIUS..=CHUNK_RADIUS {
+            for dz in -CHUNK_RADIUS..=CHUNK_RADIUS {
+                desired.insert(ChunkPos::new(center.x + dx, center.z + dz));
             }
-            send_response(conn, &encode_set_center(center.x, center.z));
-            send_response(conn, &encode_batch_start());
-            let mut desired = HashSet::new();
-            for dx in -CHUNK_RADIUS..=CHUNK_RADIUS {
-                for dz in -CHUNK_RADIUS..=CHUNK_RADIUS {
-                    desired.insert(ChunkPos::new(center.x + dx, center.z + dz));
-                }
-            }
-            let mut sent = 0i32;
-            if let Some(session) = self.sessions.get(&id) {
+        }
+        let first = self
+            .sessions
+            .get(&id)
+            .map(|session| session.chunk_center.is_none())
+            .unwrap_or(false);
+        let center_changed = self
+            .sessions
+            .get(&id)
+            .map(|session| session.chunk_center != Some(center))
+            .unwrap_or(false);
+        let removed: Vec<ChunkPos> = match self.sessions.get(&id) {
+            Some(session) => {
                 let mut removed: Vec<ChunkPos> =
                     session.sent_chunks.difference(&desired).copied().collect();
                 removed.sort_by_key(|pos| (pos.x, pos.z));
-                for pos in removed {
-                    send_response(conn, &encode_unload_chunk(pos.x, pos.z));
-                }
+                removed
+            }
+            None => return,
+        };
+        // Chunks still missing at this position, oldest-center first.
+        let added: Vec<ChunkPos> = match self.sessions.get(&id) {
+            Some(session) => {
                 let mut added: Vec<ChunkPos> =
                     desired.difference(&session.sent_chunks).copied().collect();
                 added.sort_by_key(|pos| (pos.x, pos.z));
-                for pos in added {
-                    let chunk = world.load_chunk(pos);
-                    send_response(conn, &encode_chunk_data(chunk));
-                    sent += 1;
-                }
+                added.truncate(CHUNKS_PER_TICK);
+                added
+            }
+            None => return,
+        };
+        if !center_changed && removed.is_empty() && added.is_empty() {
+            return;
+        }
+        let Some(world) = worlds.get_mut(DEFAULT_WORLD_NAME) else {
+            return;
+        };
+        let Some(conn) = network.connection_mut(id) else {
+            self.remove_session(id);
+            return;
+        };
+        if first {
+            send_response(conn, &encode_game_event(13, 0.0));
+        }
+        if center_changed {
+            send_response(conn, &encode_set_center(center.x, center.z));
+        }
+        for pos in &removed {
+            send_response(conn, &encode_unload_chunk(pos.x, pos.z));
+        }
+        let mut sent = 0i32;
+        if !added.is_empty() {
+            send_response(conn, &encode_batch_start());
+            for pos in &added {
+                let chunk = world.load_chunk(*pos);
+                send_response(conn, &encode_chunk_data(chunk));
+                sent += 1;
             }
             send_response(conn, &encode_batch_finished(sent));
-            if conn.is_closed() {
-                self.remove_session(id);
-                continue;
+        }
+        if conn.is_closed() {
+            self.remove_session(id);
+            return;
+        }
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.chunk_center = Some(center);
+            for pos in removed {
+                session.sent_chunks.remove(&pos);
             }
-            if let Some(session) = self.sessions.get_mut(&id) {
-                session.chunk_center = Some(center);
-                session.sent_chunks = desired;
+            for pos in added {
+                session.sent_chunks.insert(pos);
             }
         }
     }
@@ -760,17 +856,9 @@ impl JavaHandler {
         };
         let before = (player.x, player.y, player.z);
         let mut correct = false;
-        // Flying players (creative toggle, spectators) are exempt from
-        // collision and gravity; landing happens via the flying toggle,
-        // not a ground probe.
-        if player.is_flying_exempt() {
-            session.sim_x = player.x;
-            session.sim_z = player.z;
-            player.vy = 0.0;
-            player.on_ground = false;
-            return correct;
-        }
-        if collides(world, player.x, player.y, player.z) {
+        // Only spectators noclip. Creative flight still collides with
+        // blocks (vanilla behavior); both skip gravity below.
+        if player.gamemode != GameMode::Spectator && collides(world, player.x, player.y, player.z) {
             player.x = session.sim_x;
             player.z = session.sim_z;
             if (player.x - before.0).hypot(player.z - before.2) > CORRECTION_THRESHOLD {
@@ -779,6 +867,16 @@ impl JavaHandler {
         }
         player.vx = player.x - session.sim_x;
         player.vz = player.z - session.sim_z;
+        // Flying players (creative toggle, spectators) are exempt from
+        // gravity; landing happens via the flying toggle, not a ground
+        // probe.
+        if player.is_flying_exempt() {
+            session.sim_x = player.x;
+            session.sim_z = player.z;
+            player.vy = 0.0;
+            player.on_ground = false;
+            return correct;
+        }
         match world.ground_top(player.x, player.z, player.y) {
             Some(top) if player.y <= top + 0.001 && player.vy <= 0.0 => {
                 if before.1 < top - CORRECTION_THRESHOLD {
@@ -874,6 +972,12 @@ impl JavaHandler {
             Some(player) => player.clone(),
             None => return,
         };
+        // Spectators and adventure players cannot interact with blocks.
+        // (Spectator clients predict nothing, so silence needs no correction.)
+        if matches!(player.gamemode, GameMode::Spectator | GameMode::Adventure) {
+            debug!("connection {id} edit ignored in {:?}", player.gamemode);
+            return;
+        }
         let held = player.held_item();
         let creative = player.is_creative();
         let (target, block, sequence) = match edit {
@@ -1895,6 +1999,7 @@ enum PacketAction {
     Edit(PendingEdit),
     KeyDrop(KeyDrop),
     ChatCommand(String),
+    KeepAliveAck(i64),
     SelectSlot(u8),
     HeldEcho,
     Click(PendingClick),
@@ -1960,6 +2065,22 @@ fn handle_packet(
         }
         (ProtocolState::Login, 0x00) => {
             let login = decode_login_start(payload)?;
+            // Reject outdated clients now with a readable message instead
+            // of letting them desync later against 776 registries.
+            if session.protocol_version != crate::java::PROTOCOL_VERSION {
+                let reason = format!(
+                    "Outdated client! This server is {} (protocol {}).",
+                    crate::java::VERSION_NAME,
+                    crate::java::PROTOCOL_VERSION
+                );
+                send_response(conn, &encode_login_disconnect(&reason));
+                conn.close();
+                debug!(
+                    "connection {} rejected outdated protocol {}",
+                    session.id, session.protocol_version
+                );
+                return Ok(PacketAction::None);
+            }
             session.login_name = Some(login.name.clone());
             info!("Player login started: {}", login.name);
             return Ok(PacketAction::CompleteLogin {
@@ -2220,6 +2341,18 @@ fn handle_packet(
                 session.id
             );
         }
+        (ProtocolState::Play, 0x1C) => {
+            let mut reader = Reader::new(payload);
+            if let Ok(answer) = reader.read_i64() {
+                if reader.remaining() == 0 {
+                    return Ok(PacketAction::KeepAliveAck(answer));
+                }
+            }
+            debug!(
+                "connection {} keepalive answer with unexpected shape tolerated",
+                session.id
+            );
+        }
         // Unknown IDs are tolerated (debug-logged) so a vanilla client
         // sending newer/optional packets doesn't get disconnected.
         // Reaching play means config already succeeded — dropping here
@@ -2368,6 +2501,9 @@ fn click_shift(inventory: &mut Inventory, slot: i32) -> bool {
     let (start, end) = if (9..36).contains(&index) {
         (crate::inventory::HOTBAR_START, 45)
     } else if (36..45).contains(&index) {
+        (9, 36)
+    } else if index == 45 {
+        // Offhand shift-clicks into the main inventory.
         (9, 36)
     } else {
         return false;
@@ -2866,6 +3002,80 @@ mod tests {
     }
 
     #[test]
+    fn dead_client_kicked_after_keepalive_timeout() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "SilentPlayer");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+
+        // 600 ticks of silence past the play-entry ack is tolerated (601
+        // total); tick 602 trips the 30-second timeout.
+        for tick in 2..=602 {
+            stack.1.pump(&mut stack.0, tick);
+        }
+        wait_until(&mut stack, |n| n.connection_count() == 0);
+        assert_eq!(stack.1.player_count(), 0);
+        // Three unanswered challenges (ticks 200/400/600) precede the kick.
+        for _ in 0..3 {
+            let (id, _) = client.read_packet();
+            assert_eq!(id, 0x2C);
+        }
+        client.expect_eof();
+    }
+
+    #[test]
+    fn keepalive_ack_keeps_client_connected() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "PunctualPlayer");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+
+        stack.1.pump(&mut stack.0, 200);
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x2C);
+        assert_eq!(Reader::new(&payload).read_i64().unwrap(), 200);
+
+        // A wrong challenge id must not revive the clock.
+        let mut wrong = Writer::new();
+        wrong.write_i64(999);
+        client.send_packet(0x1C, &wrong.into_bytes());
+        stack.0.poll();
+        stack.1.pump(&mut stack.0, 200);
+        assert_eq!(
+            stack.1.sessions.get(&1).unwrap().last_keepalive_ack,
+            Some(1)
+        );
+
+        let mut ack = Writer::new();
+        ack.write_i64(200);
+        client.send_packet(0x1C, &ack.into_bytes());
+        stack.0.poll();
+        stack.1.pump(&mut stack.0, 200);
+        assert_eq!(
+            stack.1.sessions.get(&1).unwrap().last_keepalive_ack,
+            Some(200)
+        );
+
+        // Exactly 600 ticks after the ack is still fine; 601 is not.
+        for tick in 201..=800 {
+            stack.1.pump(&mut stack.0, tick);
+        }
+        assert_eq!(stack.0.connection_count(), 1);
+        assert_eq!(stack.1.player_count(), 1);
+        stack.1.pump(&mut stack.0, 801);
+        wait_until(&mut stack, |n| n.connection_count() == 0);
+        assert_eq!(stack.1.player_count(), 0);
+    }
+
+    #[test]
     fn unknown_play_packet_disconnects() {
         // Play-phase packets are tolerated now (no world sim yet):
         // unknown IDs must NOT drop the connection (that surfaces as
@@ -3015,45 +3225,67 @@ mod tests {
             client.read_packet();
         }
         let mut worlds = WorldManager::create_default();
-        stack.1.pump_chunks(&mut stack.0, &mut worlds);
-        // The multi-megabyte chunk burst exceeds socket buffers, so keep
-        // flushing from another thread while the main thread reads.
         let side = 2 * CHUNK_RADIUS + 1;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                for _ in 0..3000 {
-                    stack.0.poll();
-                    thread::sleep(Duration::from_millis(2));
+        // Streaming is staggered: the first pump opens with the game event,
+        // center and batch start plus the first few chunks.
+        stack.1.pump_chunks(&mut stack.0, &mut worlds);
+        stack.0.poll();
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x26);
+        assert_eq!(payload[0], 13);
+
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x5E);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x0C);
+
+        // Drain staggered batches (pump + flush + read) until all arrive.
+        // Batch framing (0x0C/0x0B) repeats per tick, so completion is
+        // tracked via finished-packet payloads, not packet counts.
+        let mut chunks = 0;
+        let mut finished = 0;
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        for _ in 0..120 {
+            stack.1.pump_chunks(&mut stack.0, &mut worlds);
+            stack.0.poll();
+            loop {
+                let mut probe = [0u8; 1];
+                if client.stream.peek(&mut probe).is_err() {
+                    break;
                 }
-            });
-
-            let (id, payload) = client.read_packet();
-            assert_eq!(id, 0x26);
-            assert_eq!(payload[0], 13);
-
-            let (id, payload) = client.read_packet();
-            assert_eq!(id, 0x5E);
-            let mut reader = Reader::new(&payload);
-            assert_eq!(reader.read_varint().unwrap(), 0);
-            assert_eq!(reader.read_varint().unwrap(), 0);
-
-            let (id, _) = client.read_packet();
-            assert_eq!(id, 0x0C);
-
-            for _ in 0..side * side {
                 let (id, payload) = client.read_packet();
-                assert_eq!(id, 0x2D);
-                let mut reader = Reader::new(&payload);
-                let x = reader.read_i32().unwrap();
-                let z = reader.read_i32().unwrap();
-                assert!(x.abs() <= CHUNK_RADIUS);
-                assert!(z.abs() <= CHUNK_RADIUS);
+                if id == 0x2D {
+                    let mut reader = Reader::new(&payload);
+                    let x = reader.read_i32().unwrap();
+                    let z = reader.read_i32().unwrap();
+                    assert!(x.abs() <= CHUNK_RADIUS);
+                    assert!(z.abs() <= CHUNK_RADIUS);
+                    chunks += 1;
+                } else if id == 0x0B {
+                    finished += Reader::new(&payload).read_varint().unwrap();
+                    if finished >= side * side {
+                        break;
+                    }
+                } else if id != 0x0C {
+                    panic!("unexpected packet in chunk stream: 0x{id:02X}");
+                }
             }
-
-            let (id, payload) = client.read_packet();
-            assert_eq!(id, 0x0B);
-            assert_eq!(Reader::new(&payload).read_varint().unwrap(), side * side);
-        });
+            if finished >= side * side {
+                break;
+            }
+        }
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(chunks, side * side);
         assert_eq!(
             worlds.get(DEFAULT_WORLD_NAME).unwrap().loaded_chunk_count() as i32,
             side * side
@@ -3133,21 +3365,8 @@ mod tests {
             client.read_packet();
         }
         let mut worlds = WorldManager::create_default();
-        stack.1.pump_chunks(&mut stack.0, &mut worlds);
         let side = 2 * CHUNK_RADIUS + 1;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                for _ in 0..4000 {
-                    stack.0.poll();
-                    thread::sleep(Duration::from_millis(2));
-                }
-            });
-            for _ in 0..2 + side * side + 1 {
-                client.read_packet();
-            }
-            let (id, _) = client.read_packet();
-            assert_eq!(id, 0x0B);
-        });
+        drain_stream(&mut stack, &mut worlds, &mut client);
 
         for x in [10.0, 20.0, 30.0, 40.0] {
             let mut body = Writer::new();
@@ -3161,37 +3380,57 @@ mod tests {
         }
         settle(&mut stack);
         assert_eq!(stack.1.players.get(1).unwrap().x, 40.0);
-        stack.1.pump_chunks(&mut stack.0, &mut worlds);
 
+        // Moving two chunks over unloads a 2-wide strip and streams the new
+        // one; unloads arrive promptly while chunks trickle per tick.
         let added: i32 = 2 * side;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                for _ in 0..3000 {
-                    stack.0.poll();
-                    thread::sleep(Duration::from_millis(2));
+        let mut unloads = 0;
+        let mut chunks = 0;
+        let mut finished = 0;
+        let mut saw_center = false;
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        for _ in 0..60 {
+            stack.1.pump_chunks(&mut stack.0, &mut worlds);
+            stack.0.poll();
+            loop {
+                let mut probe = [0u8; 1];
+                if client.stream.peek(&mut probe).is_err() {
+                    break;
                 }
-            });
-            let (id, payload) = client.read_packet();
-            assert_eq!(id, 0x5E);
-            let mut reader = Reader::new(&payload);
-            assert_eq!(reader.read_varint().unwrap(), 2);
-            assert_eq!(reader.read_varint().unwrap(), 0);
-
-            let (id, _) = client.read_packet();
-            assert_eq!(id, 0x0C);
-
-            for _ in 0..added {
-                let (id, _) = client.read_packet();
-                assert_eq!(id, 0x25);
+                let (id, payload) = client.read_packet();
+                match id {
+                    0x5E => {
+                        let mut reader = Reader::new(&payload);
+                        assert_eq!(reader.read_varint().unwrap(), 2);
+                        assert_eq!(reader.read_varint().unwrap(), 0);
+                        saw_center = true;
+                    }
+                    0x25 => unloads += 1,
+                    0x2D => chunks += 1,
+                    0x0C => {}
+                    0x0B => {
+                        finished += Reader::new(&payload).read_varint().unwrap();
+                        if finished >= added && unloads >= added {
+                            break;
+                        }
+                    }
+                    _ => panic!("unexpected packet after move: 0x{id:02X}"),
+                }
             }
-            for _ in 0..added {
-                let (id, _) = client.read_packet();
-                assert_eq!(id, 0x2D);
+            if finished >= added && unloads >= added {
+                break;
             }
-            let (id, payload) = client.read_packet();
-            assert_eq!(id, 0x0B);
-            assert_eq!(Reader::new(&payload).read_varint().unwrap(), added);
-        });
+        }
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(saw_center);
+        assert_eq!(unloads, added);
+        assert_eq!(chunks, added);
 
         stack.1.pump_chunks(&mut stack.0, &mut worlds);
         client
@@ -3208,20 +3447,46 @@ mod tests {
 
     fn drain_stream(
         stack: &mut (NetworkManager, JavaHandler, std::net::SocketAddr),
+        worlds: &mut WorldManager,
         client: &mut ScriptClient,
     ) {
-        let side = 2 * CHUNK_RADIUS + 1;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                for _ in 0..4000 {
-                    stack.0.poll();
-                    thread::sleep(Duration::from_millis(2));
+        // Streaming is staggered across ticks; pump, flush and read
+        // progressively (flushing matters: bursts bigger than the socket
+        // buffers sit in the server outbox until poll() flushes them).
+        // Counts Chunk Batch Finished payloads until the radius is complete.
+        let total = 2 * CHUNK_RADIUS + 1;
+        let total = total * total;
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut finished = 0;
+        for _ in 0..120 {
+            stack.1.pump_chunks(&mut stack.0, worlds);
+            stack.0.poll();
+            loop {
+                let mut probe = [0u8; 1];
+                if client.stream.peek(&mut probe).is_err() {
+                    break;
                 }
-            });
-            for _ in 0..3 + side * side + 1 {
-                client.read_packet();
+                let (id, payload) = client.read_packet();
+                if id == 0x0B {
+                    finished += Reader::new(&payload).read_varint().unwrap();
+                    if finished >= total {
+                        client
+                            .stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        return;
+                    }
+                }
             }
-        });
+        }
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        panic!("chunk stream stalled at {finished}/{total} chunks");
     }
 
     #[test]
@@ -3235,8 +3500,7 @@ mod tests {
             client.read_packet();
         }
         let mut worlds = WorldManager::create_default();
-        stack.1.pump_chunks(&mut stack.0, &mut worlds);
-        drain_stream(&mut stack, &mut client);
+        drain_stream(&mut stack, &mut worlds, &mut client);
 
         let mut speeds = Vec::new();
         for _ in 0..300 {
@@ -3279,8 +3543,7 @@ mod tests {
             client.read_packet();
         }
         let mut worlds = WorldManager::create_default();
-        stack.1.pump_chunks(&mut stack.0, &mut worlds);
-        drain_stream(&mut stack, &mut client);
+        drain_stream(&mut stack, &mut worlds, &mut client);
 
         stack.1.players.get_mut(1).unwrap().y = 60.0;
         stack.1.tick_physics(&mut stack.0, &worlds);
@@ -3293,6 +3556,45 @@ mod tests {
         assert_eq!(reader.read_f64().unwrap(), 0.0);
         assert_eq!(reader.read_f64().unwrap(), 65.0);
         assert_eq!(reader.read_f64().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn creative_flight_collides_but_spectator_noclips() {
+        for (mode, snaps) in [(GameMode::Creative, true), (GameMode::Spectator, false)] {
+            let mut stack = test_stack();
+            let addr = stack.2;
+            let mut client = ScriptClient::connect(addr);
+            wait_until(&mut stack, |n| n.connection_count() == 1);
+            join_play(&mut stack, &mut client, "Flyer");
+            for _ in 0..3 {
+                client.read_packet();
+            }
+            let mut worlds = WorldManager::create_default();
+            drain_stream(&mut stack, &mut worlds, &mut client);
+            set_gamemode(&mut stack, mode);
+            read_gamemode_switch(&mut client, mode);
+            client.read_packet(); // container
+            client.read_packet(); // abilities
+                                  // Both fly (spectators unconditionally, creatives via toggle).
+            stack.1.players.get_mut(1).unwrap().flying = true;
+            assert!(stack.1.players.get(1).unwrap().is_flying_exempt());
+
+            // Wedge into solid ground: creative snaps back, spectator stays.
+            let player = stack.1.players.get_mut(1).unwrap();
+            player.x = 0.5;
+            player.y = 64.2;
+            player.z = 0.5;
+            stack.1.tick_physics(&mut stack.0, &worlds);
+            let player = stack.1.players.get(1).unwrap();
+            if snaps {
+                assert_eq!((player.x, player.z), (0.0, 0.0));
+                let (id, _) = client.read_packet();
+                assert_eq!(id, 0x48); // teleport correction
+            } else {
+                assert_eq!((player.x, player.z), (0.5, 0.5));
+                expect_silence(&mut client);
+            }
+        }
     }
 
     #[test]
@@ -3803,6 +4105,50 @@ mod tests {
     }
 
     #[test]
+    fn spectator_and_adventure_cannot_edit_blocks() {
+        for mode in [GameMode::Spectator, GameMode::Adventure] {
+            let mut stack = test_stack();
+            let addr = stack.2;
+            let mut first = ScriptClient::connect(addr);
+            wait_until(&mut stack, |n| n.connection_count() == 1);
+            join_play(&mut stack, &mut first, "ModePlayer");
+            for _ in 0..3 {
+                first.read_packet();
+            }
+            seed_visible(&mut stack, 1);
+            let mut worlds = lowered_worlds(&mut stack);
+            set_gamemode(&mut stack, mode);
+            read_gamemode_switch(&mut first, mode);
+            first.read_packet(); // container resync
+            first.read_packet(); // abilities
+
+            send_dig(&mut first, 2, 0, 64, 0, 1, 70);
+            settle(&mut stack);
+            stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
+            assert_eq!(
+                worlds
+                    .get(crate::world::DEFAULT_WORLD_NAME)
+                    .unwrap()
+                    .get_block(0, 64, 0),
+                Some(crate::world::Block::GrassBlock)
+            );
+            expect_silence(&mut first);
+
+            send_place(&mut first, 0, 64, 0, 1, 71);
+            settle(&mut stack);
+            stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
+            assert_eq!(
+                worlds
+                    .get(crate::world::DEFAULT_WORLD_NAME)
+                    .unwrap()
+                    .get_block(0, 65, 0),
+                Some(crate::world::Block::Air)
+            );
+            expect_silence(&mut first);
+        }
+    }
+
+    #[test]
     fn placing_needs_air_face_and_reach() {
         let mut stack = test_stack();
         let (mut first, mut second) = join_pair(&mut stack);
@@ -3838,7 +4184,7 @@ mod tests {
         assert_eq!(id, 0x08);
         let mut reader = Reader::new(&payload);
         assert_eq!(reader.read_position().unwrap(), (0, 64, 0));
-        assert_eq!(reader.read_varint().unwrap(), 8);
+        assert_eq!(reader.read_varint().unwrap(), 9); // grass (dry)
 
         send_place(&mut first, 0, 67, 0, 1, 13);
         settle(&mut stack);
@@ -4120,6 +4466,28 @@ mod tests {
         let player = stack.1.players.get(1).unwrap();
         assert_eq!(player.inventory.get(9).unwrap().count, 64);
         assert!(player.inventory.get(36).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shift_click_from_offhand_moves_to_main_inventory() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        stack.1.players.get_mut(1).unwrap().inventory.set(
+            45,
+            crate::inventory::ItemStack::new(crate::inventory::Item::Stone, 5).unwrap(),
+        );
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+
+        send_click(&mut first, 0, 1, 45, 0, 1);
+        settle(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        let player = stack.1.players.get(1).unwrap();
+        assert!(player.inventory.get(45).unwrap().is_empty());
+        assert_eq!(
+            player.inventory.get(9).unwrap(),
+            crate::inventory::ItemStack::new(crate::inventory::Item::Stone, 5).unwrap()
+        );
     }
 
     #[test]
@@ -4639,6 +5007,86 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_login_broadcasts_tab_remove() {
+        let mut stack = test_stack();
+        let (mut first, mut second) = join_pair(&mut stack);
+        seed_visible(&mut stack, 1);
+        seed_visible(&mut stack, 2);
+        stack.1.pump_visibility(&mut stack.0);
+        for client in [&mut first, &mut second] {
+            for _ in 0..3 {
+                client.read_packet();
+            }
+        }
+
+        // Third client steals SecondPlayer's name with a different uuid.
+        let addr = stack.2;
+        let mut third = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 3);
+        join_play_uuid(
+            &mut stack,
+            &mut third,
+            "SecondPlayer",
+            0x123E_4567_E89B_12D3_A456_4266_1417_4002,
+        );
+        for _ in 0..3 {
+            third.read_packet();
+        }
+        // Victim gets the duplicate-login disconnect.
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x00);
+        second.expect_eof();
+        wait_until(&mut stack, |n| n.connection_count() == 2);
+
+        // Observer first learns about the newcomer, then sees the victim
+        // removed from the tab list (no ghost entry).
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x46);
+        stack.1.pump_visibility(&mut stack.0);
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x45);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_varint().unwrap(), 1);
+        assert_eq!(
+            reader.read_uuid().unwrap(),
+            0x123E_4567_E89B_12D3_A456_4266_1417_4001
+        );
+    }
+
+    #[test]
+    fn full_server_turns_newcomers_away() {
+        let mut stack = test_stack();
+        assert_eq!(stack.1.player_count(), 0);
+        for i in 0..20 {
+            stack.1.players.insert(PlayerSession::new(
+                100 + i as u64,
+                format!("Filler{i}"),
+                Some(0x2000 + i as u128),
+                776,
+                100 + i,
+                0x3000 + i as u128,
+            ));
+        }
+        assert_eq!(stack.1.player_count(), 20);
+
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        client.send_handshake(776, 2);
+        client.send_login_start("Latecomer");
+        settle(&mut stack);
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x00);
+        assert!(Reader::new(&payload)
+            .read_string()
+            .unwrap()
+            .contains("full"));
+        client.expect_eof();
+        wait_until(&mut stack, |n| n.connection_count() == 0);
+        assert_eq!(stack.1.player_count(), 20);
+    }
+
+    #[test]
     fn malformed_login_start_disconnects() {
         let mut stack = test_stack();
         let addr = stack.2;
@@ -4701,6 +5149,25 @@ mod tests {
         assert!(versions.contains(&776));
         assert!(versions.contains(&777));
         assert!(versions.contains(&775));
+    }
+
+    #[test]
+    fn outdated_client_disconnected_on_login() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+
+        client.send_handshake(775, 2);
+        client.send_login_start("OldPlayer");
+        settle(&mut stack);
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x00);
+        let reason = Reader::new(&payload).read_string().unwrap();
+        assert!(reason.contains("Outdated client"));
+        client.expect_eof();
+        wait_until(&mut stack, |n| n.connection_count() == 0);
+        assert_eq!(stack.1.player_count(), 0);
     }
 
     #[test]

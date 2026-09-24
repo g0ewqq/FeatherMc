@@ -6,7 +6,8 @@ pub const CHUNK_RADIUS: i32 = 6;
 
 const AIR_STATE: i32 = 0;
 const STONE_STATE: i32 = 1;
-const GRASS_STATE: i32 = 8;
+// Grass Block states 8 (snowy) / 9 (dry); 9 is the natural default.
+const GRASS_STATE: i32 = 9;
 const DIRT_STATE: i32 = 10;
 const PLAINS_BIOME: i32 = 0;
 
@@ -184,7 +185,7 @@ mod tests {
     fn maps_blocks_to_vanilla_states() {
         assert_eq!(block_to_state(Block::Air), 0);
         assert_eq!(block_to_state(Block::Stone), 1);
-        assert_eq!(block_to_state(Block::GrassBlock), 8);
+        assert_eq!(block_to_state(Block::GrassBlock), 9); // dry (default)
         assert_eq!(block_to_state(Block::Dirt), 10);
     }
 

@@ -11,6 +11,8 @@ use crate::{
 };
 
 const STATUS_INTERVAL_TICKS: u64 = 200;
+/// Extra sockets beyond max_players for status pings and logins in flight.
+const CONNECTION_HEADROOM: usize = 32;
 
 pub struct Server {
     config: Config,
@@ -87,6 +89,12 @@ impl Server {
         info!("Starting network");
         let addr = self.config.network.socket_addr()?;
         self.network.bind(addr)?;
+        // Bound total sockets (players + status pings + logins in flight) so
+        // idle connections cannot grow memory without limit. Play slots
+        // themselves are capped at max_players with a "server full" reply.
+        self.network.set_max_connections(Some(
+            self.config.server.max_players as usize + CONNECTION_HEADROOM,
+        ));
         info!("Listening on {addr}");
 
         self.scheduler.run_every(STATUS_INTERVAL_TICKS, |tick| {

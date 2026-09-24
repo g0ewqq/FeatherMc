@@ -22,6 +22,7 @@ pub struct NetworkManager {
     connections: HashMap<ConnectionId, Connection>,
     next_id: ConnectionId,
     metrics: NetworkMetrics,
+    max_connections: Option<usize>,
 }
 
 impl NetworkManager {
@@ -32,7 +33,15 @@ impl NetworkManager {
             connections: HashMap::new(),
             next_id: 1,
             metrics: NetworkMetrics::default(),
+            max_connections: None,
         }
+    }
+
+    /// Bounds total accepted connections so idle sockets cannot grow memory
+    /// without limit. When reached, new sockets stay in the OS backlog until
+    /// a slot frees up. `None` (the default) accepts without bound.
+    pub fn set_max_connections(&mut self, max: Option<usize>) {
+        self.max_connections = max;
     }
 
     pub fn bind(&mut self, addr: SocketAddr) -> Result<(), NetworkError> {
@@ -126,6 +135,12 @@ impl NetworkManager {
 
     fn accept_pending(&mut self) {
         for _ in 0..MAX_ACCEPTS_PER_TICK {
+            if self
+                .max_connections
+                .is_some_and(|max| self.connections.len() >= max)
+            {
+                break;
+            }
             let next = match self.listener.as_ref() {
                 None => return,
                 Some(listener) => match listener.accept() {
@@ -328,6 +343,28 @@ mod tests {
         drop((one, two, three));
         wait_until(&mut manager, |m| m.connection_count() == 0);
         assert_eq!(manager.metrics().disconnected, 3);
+    }
+
+    #[test]
+    fn max_connections_leaves_overflow_in_backlog() {
+        let (mut manager, addr) = test_manager();
+        manager.set_max_connections(Some(1));
+        let first = connect(addr);
+        wait_until(&mut manager, |m| m.connection_count() == 1);
+
+        let second = connect(addr);
+        for _ in 0..10 {
+            manager.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(manager.connection_count(), 1);
+
+        drop(first);
+        wait_until(&mut manager, |m| m.connection_count() == 0);
+        wait_until(&mut manager, |m| m.connection_count() == 1);
+        assert_eq!(manager.metrics().accepted, 2);
+        drop(second);
+        wait_until(&mut manager, |m| m.connection_count() == 0);
     }
 
     #[test]
