@@ -2,10 +2,14 @@ use std::io::{self, BufRead};
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 
+use crate::java::player::GameMode;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsoleCommand {
     Stop,
     Help,
+    /// Switch every connected player to the given game mode.
+    GameMode(GameMode),
     Unknown(String),
 }
 
@@ -15,15 +19,33 @@ pub enum Event {
     Command(ConsoleCommand),
 }
 
+pub(crate) fn parse_gamemode(word: &str) -> Option<GameMode> {
+    match word.to_ascii_lowercase().as_str() {
+        "survival" | "s" | "0" => Some(GameMode::Survival),
+        "creative" | "c" | "1" => Some(GameMode::Creative),
+        "adventure" | "a" | "2" => Some(GameMode::Adventure),
+        "spectator" | "sp" | "3" => Some(GameMode::Spectator),
+        _ => None,
+    }
+}
+
 #[must_use]
 pub fn parse(input: &str) -> Option<ConsoleCommand> {
     let line = input.trim();
     if line.is_empty() {
         return None;
     }
-    match line.split_whitespace().next() {
+    let mut words = line.split_whitespace();
+    match words.next() {
         Some(word) if word.eq_ignore_ascii_case("stop") => Some(ConsoleCommand::Stop),
         Some(word) if word.eq_ignore_ascii_case("help") => Some(ConsoleCommand::Help),
+        Some(word) if word.eq_ignore_ascii_case("gamemode") => match words.next() {
+            Some(arg) => match parse_gamemode(arg) {
+                Some(mode) => Some(ConsoleCommand::GameMode(mode)),
+                None => Some(ConsoleCommand::Unknown(line.to_owned())),
+            },
+            None => Some(ConsoleCommand::Unknown(line.to_owned())),
+        },
         _ => Some(ConsoleCommand::Unknown(line.to_owned())),
     }
 }
@@ -67,6 +89,30 @@ mod tests {
     fn ignores_blank_lines() {
         assert_eq!(parse(""), None);
         assert_eq!(parse("   "), None);
+    }
+
+    #[test]
+    fn parses_gamemode() {
+        assert_eq!(
+            parse("gamemode creative"),
+            Some(ConsoleCommand::GameMode(GameMode::Creative))
+        );
+        assert_eq!(
+            parse("gamemode 0"),
+            Some(ConsoleCommand::GameMode(GameMode::Survival))
+        );
+        assert_eq!(
+            parse("GAMEMODE SP"),
+            Some(ConsoleCommand::GameMode(GameMode::Spectator))
+        );
+        assert_eq!(
+            parse("gamemode nope"),
+            Some(ConsoleCommand::Unknown("gamemode nope".to_owned()))
+        );
+        assert_eq!(
+            parse("gamemode"),
+            Some(ConsoleCommand::Unknown("gamemode".to_owned()))
+        );
     }
 
     #[test]

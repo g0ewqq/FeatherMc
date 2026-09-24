@@ -103,10 +103,15 @@ impl Server {
             self.scheduler.tick(tick);
             self.network.poll();
             self.java.pump(&mut self.network, tick);
-            self.java.tick_physics(&mut self.network, &self.worlds);
+            // Stream chunks before simulating physics so ground exists under
+            // players crossing into newly entered chunks (avoids a tick of
+            // falling through unloaded ground at chunk edges).
             self.java.pump_chunks(&mut self.network, &mut self.worlds);
+            self.java.tick_physics(&mut self.network, &self.worlds);
             self.java.pump_visibility(&mut self.network);
-            self.java.pump_blocks(&mut self.network, &mut self.worlds);
+            self.java
+                .pump_blocks(&mut self.network, &mut self.worlds, tick);
+            self.java.pump_drops(&mut self.network, &mut self.worlds);
             self.java.pump_inventory(&mut self.network);
             self.clock.record(started.elapsed());
 
@@ -117,7 +122,10 @@ impl Server {
                     break 'run;
                 }
                 Ok(Event::Command(ConsoleCommand::Help)) => {
-                    info!("Available commands: stop, help");
+                    info!("Available commands: stop, help, gamemode <survival|creative|adventure|spectator>");
+                }
+                Ok(Event::Command(ConsoleCommand::GameMode(mode))) => {
+                    self.java.set_gamemode(&mut self.network, mode);
                 }
                 Ok(Event::Command(ConsoleCommand::Unknown(input))) => {
                     info!("Unknown command {input:?}. Type \"help\".");

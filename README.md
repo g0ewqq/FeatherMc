@@ -113,12 +113,20 @@ java_port = 25565
 - Item and inventory foundation: validated stacks, 46-slot inventory with
   hotbar selection, starting items, click/drag/shift handling with
   state-ID validation, container sync, held-item-driven placement
+- Creative mode: console `gamemode` switching and in-game
+  `/gamemode <mode> [player]`, abilities sync with client-toggled
+  flight (gravity-exempt), instant digging, placement without
+  consuming items, and creative slot writes with slot -1 drops
 - Full NBT reader/writer, TOML config, structured logging
 
 ## Known limitations
 
 Single flat world, no disk persistence, placing uses the held hotbar
-item, full-bright lighting, default skins, no mobs, combat, redstone,
+item and only Stone, Dirt and Grass Block exist server-side (other
+items fall back to the held survival item and the client is corrected,
+which looks like morphing), creative inventory is client-trusted (any
+stack size up to the max and any known item can be written to any
+slot), full-bright lighting, default skins, no mobs, combat, redstone,
 fluids or plugins.
 
 ## Project layout

@@ -3,6 +3,7 @@ use super::packets::encode_packet;
 use super::proto::Writer;
 
 pub const PLAYER_ENTITY_TYPE: i32 = 156;
+pub const ITEM_ENTITY_TYPE: i32 = 71;
 
 const INFO_ADD_PLAYER: u8 = 0x01;
 const INFO_UPDATE_GAMEMODE: u8 = 0x04;
@@ -46,6 +47,12 @@ pub fn encode_player_info_remove(uuids: &[u128]) -> Vec<u8> {
     encode_packet(0x45, &body.into_bytes())
 }
 
+/// Zero-velocity LpVec3. Per the 26.2 data types page, (0,0,0) encodes as
+/// a single 0x00 byte (not three shorts/varints like older formats).
+fn write_stationary_velocity(body: &mut Writer) {
+    body.write_u8(0);
+}
+
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn encode_spawn_player(
@@ -64,12 +71,27 @@ pub fn encode_spawn_player(
     body.write_f64(x);
     body.write_f64(y);
     body.write_f64(z);
-    body.write_varint(0);
-    body.write_varint(0);
-    body.write_varint(0);
+    write_stationary_velocity(&mut body);
     body.write_u8(pitch_to_byte(pitch));
     body.write_u8(angle_to_byte(yaw));
     body.write_u8(angle_to_byte(yaw));
+    body.write_varint(0);
+    encode_packet(0x01, &body.into_bytes())
+}
+
+#[must_use]
+pub fn encode_spawn_item(entity_id: i32, uuid: u128, x: f64, y: f64, z: f64) -> Vec<u8> {
+    let mut body = Writer::new();
+    body.write_varint(entity_id);
+    body.write_uuid(uuid);
+    body.write_varint(ITEM_ENTITY_TYPE);
+    body.write_f64(x);
+    body.write_f64(y);
+    body.write_f64(z);
+    write_stationary_velocity(&mut body);
+    body.write_u8(0);
+    body.write_u8(0);
+    body.write_u8(0);
     body.write_varint(0);
     encode_packet(0x01, &body.into_bytes())
 }
@@ -149,6 +171,10 @@ pub fn encode_teleport_entity(
     pitch: f32,
     on_ground: bool,
 ) -> Vec<u8> {
+    // 26.2 Teleport Entity (0x7D): absolute position + velocity, yaw/pitch
+    // floats, a u32 relatives bitmask (0 = everything absolute) and
+    // on-ground. (This is NOT entity_position_sync, which is a different
+    // packet id with a path-type layout.)
     let mut body = Writer::new();
     body.write_varint(entity_id);
     body.write_f64(x);
@@ -228,9 +254,8 @@ mod tests {
         assert_eq!(reader.read_f64().unwrap(), 1.5);
         assert_eq!(reader.read_f64().unwrap(), 65.0);
         assert_eq!(reader.read_f64().unwrap(), -3.25);
-        assert_eq!(reader.read_varint().unwrap(), 0);
-        assert_eq!(reader.read_varint().unwrap(), 0);
-        assert_eq!(reader.read_varint().unwrap(), 0);
+        // LpVec3 zero velocity is a single 0x00 byte.
+        assert_eq!(reader.read_u8().unwrap(), 0);
         assert_eq!(reader.read_u8().unwrap(), pitch_to_byte(-10.0));
         assert_eq!(reader.read_u8().unwrap(), angle_to_byte(90.0));
         assert_eq!(reader.read_u8().unwrap(), angle_to_byte(90.0));
@@ -287,8 +312,10 @@ mod tests {
         assert_eq!(reader.read_f64().unwrap(), 0.0);
         assert_eq!(reader.read_f32().unwrap(), 10.0);
         assert_eq!(reader.read_f32().unwrap(), 20.0);
+        // u32 relatives bitmask: 0 = all fields absolute.
         assert_eq!(reader.read_i32().unwrap(), 0);
         assert!(reader.read_bool().unwrap());
+        assert_eq!(reader.remaining(), 0);
 
         let (id, payload) = decode_frame(&encode_destroy_entities(&[4, 9]));
         assert_eq!(id, 0x4D);
@@ -297,6 +324,22 @@ mod tests {
         assert_eq!(reader.read_varint().unwrap(), 4);
         assert_eq!(reader.read_varint().unwrap(), 9);
         assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn spawn_item_carries_type_and_position() {
+        let bytes = encode_spawn_item(9, 0xBEEF, 2.5, 65.0, -7.5);
+        let (id, payload) = decode_frame(&bytes);
+        assert_eq!(id, 0x01);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_varint().unwrap(), 9);
+        assert_eq!(reader.read_uuid().unwrap(), 0xBEEF);
+        assert_eq!(reader.read_varint().unwrap(), ITEM_ENTITY_TYPE);
+        assert_eq!(reader.read_f64().unwrap(), 2.5);
+        assert_eq!(reader.read_f64().unwrap(), 65.0);
+        assert_eq!(reader.read_f64().unwrap(), -7.5);
+        // LpVec3 zero velocity (1 byte) + pitch/yaw/head angles + data varint.
+        assert_eq!(reader.remaining(), 1 + 3 + 1);
     }
 
     #[test]

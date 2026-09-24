@@ -1,5 +1,7 @@
 use super::error::ProtoError;
+use super::packets::write_slot;
 use super::proto::{Reader, Writer};
+use crate::inventory::ItemStack;
 
 pub const FLAG_ON_FIRE: u8 = 0x01;
 pub const FLAG_SNEAKING: u8 = 0x02;
@@ -15,6 +17,7 @@ pub enum MetadataKind {
     Byte(u8),
     VarInt(i32),
     Bool(bool),
+    Slot(ItemStack),
     Pose(i32),
 }
 
@@ -24,6 +27,7 @@ impl MetadataKind {
         match self {
             MetadataKind::Byte(_) => 0,
             MetadataKind::VarInt(_) => 1,
+            MetadataKind::Slot(_) => 7,
             MetadataKind::Bool(_) => 8,
             MetadataKind::Pose(_) => 20,
         }
@@ -33,6 +37,7 @@ impl MetadataKind {
         match self {
             MetadataKind::Byte(value) => writer.write_u8(value),
             MetadataKind::VarInt(value) => writer.write_varint(value),
+            MetadataKind::Slot(stack) => write_slot(writer, stack),
             MetadataKind::Bool(value) => writer.write_bool(value),
             MetadataKind::Pose(value) => writer.write_varint(value),
         }
@@ -42,11 +47,35 @@ impl MetadataKind {
         match type_id {
             0 => Ok(MetadataKind::Byte(reader.read_u8()?)),
             1 => Ok(MetadataKind::VarInt(reader.read_varint()?)),
+            7 => Ok(MetadataKind::Slot(decode_slot(reader)?)),
             8 => Ok(MetadataKind::Bool(reader.read_bool()?)),
             20 => Ok(MetadataKind::Pose(reader.read_varint()?)),
             _ => Err(ProtoError::InvalidTag(type_id as u8)),
         }
     }
+}
+
+fn decode_slot(reader: &mut Reader) -> Result<ItemStack, ProtoError> {
+    use crate::inventory::Item;
+
+    let count = reader.read_varint()?;
+    if count <= 0 {
+        return Ok(ItemStack::empty());
+    }
+    let id = reader.read_varint()?;
+    let added = reader.read_varint()?;
+    if added != 0 {
+        return Err(ProtoError::InvalidTag(7));
+    }
+    let removed = reader.read_varint()?;
+    if removed != 0 {
+        return Err(ProtoError::InvalidTag(7));
+    }
+    let item = Item::from_id(id).ok_or(ProtoError::InvalidTag(7))?;
+    Ok(ItemStack {
+        item,
+        count: count as u32,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -135,6 +164,45 @@ mod tests {
             },
         ];
         assert_eq!(roundtrip(&entries), entries);
+    }
+
+    #[test]
+    fn slot_kind_roundtrips_componentless_stacks() {
+        use crate::inventory::{Item, ItemStack};
+
+        let entries = vec![MetadataEntry {
+            index: 8,
+            kind: MetadataKind::Slot(ItemStack::new(Item::Dirt, 3).unwrap()),
+        }];
+        assert_eq!(roundtrip(&entries), entries);
+
+        let mut writer = Writer::new();
+        writer.write_u8(8);
+        writer.write_varint(7);
+        writer.write_varint(2);
+        writer.write_varint(1);
+        writer.write_varint(0);
+        writer.write_varint(0);
+        writer.write_u8(0xFF);
+        let bytes = writer.into_bytes();
+        assert_eq!(
+            decode_metadata(&mut Reader::new(&bytes)).unwrap(),
+            vec![MetadataEntry {
+                index: 8,
+                kind: MetadataKind::Slot(ItemStack::new(Item::Stone, 2).unwrap()),
+            }]
+        );
+
+        let mut writer = Writer::new();
+        writer.write_u8(8);
+        writer.write_varint(7);
+        writer.write_varint(1);
+        writer.write_varint(1);
+        writer.write_varint(1);
+        writer.write_varint(0);
+        writer.write_u8(0xFF);
+        let bytes = writer.into_bytes();
+        assert!(decode_metadata(&mut Reader::new(&bytes)).is_err());
     }
 
     #[test]

@@ -9,23 +9,28 @@ use super::chunks::{
 use super::entities::{
     encode_destroy_entities, encode_entity_metadata, encode_entity_position,
     encode_entity_position_rotation, encode_entity_rotation, encode_head_rotation,
-    encode_player_info_add, encode_player_info_remove, encode_spawn_player, encode_teleport_entity,
+    encode_player_info_add, encode_player_info_remove, encode_spawn_item, encode_spawn_player,
+    encode_teleport_entity,
 };
 use super::error::ProtoError;
 use super::metadata::player_metadata;
+use super::metadata::{MetadataEntry, MetadataKind};
 use super::packets::{
     decode_handshake, decode_login_start, encode_block_changed_ack, encode_block_update,
-    encode_container_content, encode_default_spawn, encode_finish_configuration, encode_game_event,
-    encode_held_slot, encode_keep_alive, encode_known_packs, encode_login_disconnect,
-    encode_login_success, encode_play_login, encode_pong, encode_status_response,
-    encode_sync_position, encode_update_tags, DUPLICATE_LOGIN_REASON,
+    encode_container_content, encode_container_slot, encode_default_spawn,
+    encode_finish_configuration, encode_game_event, encode_held_slot, encode_keep_alive,
+    encode_known_packs, encode_login_disconnect, encode_login_success, encode_play_login,
+    encode_player_abilities, encode_pong, encode_status_response, encode_sync_position,
+    encode_system_chat, encode_update_tags, DUPLICATE_LOGIN_REASON,
 };
-use super::player::PlayerSession;
+use super::player::{GameMode, PlayerSession};
 use super::proto::{decode_varint_prefix, Reader};
 use super::registries::{default_registries, encode_registry_data};
 use super::registry::PlayerRegistry;
 use super::state::ProtocolState;
 use crate::config::Config;
+use crate::console::parse_gamemode;
+use crate::entity::Entity;
 use crate::inventory::{Inventory, ItemStack};
 use crate::network::{Connection, ConnectionId, NetworkManager};
 use crate::world::{Block, ChunkPos, World, WorldManager, DEFAULT_WORLD_NAME};
@@ -39,6 +44,14 @@ const TERMINAL_VELOCITY: f64 = -3.92;
 const CORRECTION_THRESHOLD: f64 = 0.5;
 const PLAYER_HALF_WIDTH: f64 = 0.3;
 const BLOCK_REACH: f64 = 7.0;
+
+fn break_ticks(block: Block) -> u64 {
+    match block {
+        Block::Air => u64::MAX,
+        Block::Stone => 150,
+        Block::Dirt | Block::GrassBlock => 15,
+    }
+}
 
 const FACE_OFFSETS: [(i32, i32, i32); 6] = [
     (0, -1, 0),
@@ -74,6 +87,14 @@ struct TrackedPose {
     pitch: f32,
     flags: u8,
     pose: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrackedDrop {
+    x: f64,
+    y: f64,
+    z: f64,
+    count: u32,
 }
 
 impl TrackedPose {
@@ -175,11 +196,16 @@ pub struct JavaSession {
     sim_x: f64,
     sim_z: f64,
     tracked: HashMap<ConnectionId, TrackedPose>,
+    drop_tracked: HashMap<i32, TrackedDrop>,
     edits: Vec<PendingEdit>,
     clicks: Vec<PendingClick>,
+    key_drops: Vec<KeyDrop>,
+    creative_slots: Vec<PendingCreativeSlot>,
     inv_dirty: bool,
     held_dirty: bool,
+    abilities_dirty: bool,
     inv_state: i32,
+    sent_state: Option<([ItemStack; crate::inventory::INVENTORY_SIZE], ItemStack)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -189,6 +215,7 @@ enum PendingEdit {
         y: i32,
         z: i32,
         sequence: i32,
+        start_tick: u64,
     },
     Place {
         x: i32,
@@ -206,6 +233,27 @@ struct PendingClick {
     slot: i32,
     button: u8,
     mode: i32,
+}
+
+/// Queued Set Creative Mode Slot update, applied in pump_drops.
+#[derive(Debug, Clone, Copy)]
+struct PendingCreativeSlot {
+    slot: i16,
+    item: Option<ItemStack>,
+}
+
+/// In-game drop keypress from PlayerAction (0x29): Q drops a single item,
+/// Ctrl+Q drops the whole held stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyDrop {
+    Single,
+    Stack,
+}
+
+enum ClickOutcome {
+    Ignored,
+    Synced,
+    Drop(ItemStack),
 }
 
 fn read_hashed_slot(reader: &mut Reader) -> Result<(), ProtoError> {
@@ -232,6 +280,36 @@ fn read_hashed_slot(reader: &mut Reader) -> Result<(), ProtoError> {
     Ok(())
 }
 
+/// Slot reader for Set Creative Mode Slot, mirroring `write_slot`: a count
+/// varint first (0 = empty, no boolean prefix), then item ID plus added /
+/// removed component counts. Only componentless stacks are accepted, matching
+/// `decode_slot` — component payloads cannot be skipped without a data
+/// component registry, and plain vanilla items carry none.
+fn read_slot(reader: &mut Reader) -> Option<Option<ItemStack>> {
+    let count = reader.read_varint().ok()?;
+    if !(0..=crate::inventory::MAX_STACK as i32).contains(&count) {
+        return None;
+    }
+    if count == 0 {
+        return Some(None);
+    }
+    let item_id = reader.read_varint().ok()?;
+    let item = crate::inventory::Item::from_id(item_id)?;
+    let added = reader.read_varint().ok()?;
+    if added != 0 {
+        return None;
+    }
+    let removed = reader.read_varint().ok()?;
+    if removed != 0 {
+        return None;
+    }
+    let count = count as u32;
+    if count == 0 || count > item.max_stack() {
+        return None;
+    }
+    Some(ItemStack::new(item, count))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigStage {
     Fresh,
@@ -256,11 +334,16 @@ impl JavaSession {
             sim_x: crate::world::SPAWN_X,
             sim_z: crate::world::SPAWN_Z,
             tracked: HashMap::new(),
+            drop_tracked: HashMap::new(),
             edits: Vec::new(),
             clicks: Vec::new(),
+            key_drops: Vec::new(),
+            creative_slots: Vec::new(),
             inv_dirty: false,
             held_dirty: false,
+            abilities_dirty: false,
             inv_state: 0,
+            sent_state: None,
         }
     }
 
@@ -321,7 +404,7 @@ impl JavaHandler {
 
     fn pump_one(&mut self, id: ConnectionId, network: &mut NetworkManager, tick: u64) {
         loop {
-            match self.pump_frame(id, network) {
+            match self.pump_frame(id, network, tick) {
                 None => break,
                 Some(PacketAction::None) => {}
                 Some(PacketAction::CompleteLogin { name, uuid }) => {
@@ -359,6 +442,40 @@ impl JavaHandler {
                 Some(PacketAction::Click(click)) => {
                     if let Some(session) = self.sessions.get_mut(&id) {
                         session.clicks.push(click);
+                    }
+                }
+                Some(PacketAction::KeyDrop(drop)) => {
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        session.key_drops.push(drop);
+                    }
+                }
+                Some(PacketAction::ChatCommand(command)) => {
+                    self.run_chat_command(id, network, &command);
+                }
+                Some(PacketAction::CreativeSlot { slot, item }) => {
+                    // Creative inventory writes are only honored for
+                    // creative players; others silently ignore them.
+                    if self.players.get(id).is_some_and(PlayerSession::is_creative) {
+                        if let Some(session) = self.sessions.get_mut(&id) {
+                            session
+                                .creative_slots
+                                .push(PendingCreativeSlot { slot, item });
+                        }
+                    }
+                }
+                Some(PacketAction::PlayerAbilities(flags)) => {
+                    if let Some(player) = self.players.get_mut(id) {
+                        if player.is_creative() {
+                            let flying = flags & crate::java::packets::ABILITY_FLYING != 0;
+                            if flying != player.flying {
+                                player.flying = flying;
+                                // Echo the authoritative state so a client
+                                // that lost the ability gets corrected.
+                                if let Some(session) = self.sessions.get_mut(&id) {
+                                    session.abilities_dirty = true;
+                                }
+                            }
+                        }
                     }
                 }
                 Some(PacketAction::MovePlayer {
@@ -415,12 +532,19 @@ impl JavaHandler {
         if session.state == ProtocolState::Play && tick % KEEPALIVE_INTERVAL_TICKS == 0 {
             send_response(conn, &encode_keep_alive(tick as i64));
         }
+        if session.state == ProtocolState::Play && session.abilities_dirty {
+            if let Some(player) = self.players.get(id) {
+                send_response(conn, &encode_player_abilities(player.ability_flags()));
+            }
+            session.abilities_dirty = false;
+        }
     }
 
     fn pump_frame(
         &mut self,
         id: ConnectionId,
         network: &mut NetworkManager,
+        tick: u64,
     ) -> Option<PacketAction> {
         let (Some(session), Some(conn)) = (self.sessions.get_mut(&id), network.connection_mut(id))
         else {
@@ -442,7 +566,7 @@ impl JavaHandler {
             session.state,
             payload.len()
         );
-        match handle_packet(&self.status, session, pid, &payload, conn) {
+        match handle_packet(&self.status, session, pid, &payload, conn, tick) {
             Ok(action) => Some(action),
             Err(e) => {
                 debug!("protocol error on connection {id}: {e}");
@@ -636,6 +760,16 @@ impl JavaHandler {
         };
         let before = (player.x, player.y, player.z);
         let mut correct = false;
+        // Flying players (creative toggle, spectators) are exempt from
+        // collision and gravity; landing happens via the flying toggle,
+        // not a ground probe.
+        if player.is_flying_exempt() {
+            session.sim_x = player.x;
+            session.sim_z = player.z;
+            player.vy = 0.0;
+            player.on_ground = false;
+            return correct;
+        }
         if collides(world, player.x, player.y, player.z) {
             player.x = session.sim_x;
             player.z = session.sim_z;
@@ -703,7 +837,12 @@ impl JavaHandler {
         }
     }
 
-    pub fn pump_blocks(&mut self, network: &mut NetworkManager, worlds: &mut WorldManager) {
+    pub fn pump_blocks(
+        &mut self,
+        network: &mut NetworkManager,
+        worlds: &mut WorldManager,
+        tick: u64,
+    ) {
         let editors: Vec<ConnectionId> = self
             .sessions
             .iter()
@@ -718,7 +857,7 @@ impl JavaHandler {
                 None => continue,
             };
             for edit in edits {
-                self.apply_edit(id, edit, network, worlds);
+                self.apply_edit(id, edit, network, worlds, tick);
             }
         }
     }
@@ -729,14 +868,18 @@ impl JavaHandler {
         edit: PendingEdit,
         network: &mut NetworkManager,
         worlds: &mut WorldManager,
+        tick: u64,
     ) {
         let player = match self.players.get(id) {
             Some(player) => player.clone(),
             None => return,
         };
         let held = player.held_item();
+        let creative = player.is_creative();
         let (target, block, sequence) = match edit {
-            PendingEdit::Break { x, y, z, sequence } => ((x, y, z), Block::Air, sequence),
+            PendingEdit::Break {
+                x, y, z, sequence, ..
+            } => ((x, y, z), Block::Air, sequence),
             PendingEdit::Place {
                 x,
                 y,
@@ -764,6 +907,24 @@ impl JavaHandler {
             return;
         };
         let current = world.get_block(target.0, target.1, target.2);
+        if let PendingEdit::Break { start_tick, .. } = edit {
+            if !creative {
+                // Only enforce hold time when there is actually something
+                // solid to mine. Air (or unloaded) should fall through to the
+                // correction path below so the client gets a block update
+                // instead of silence. Creative players break instantly.
+                if current.is_some_and(|block| block.is_solid()) {
+                    let held_ticks = tick.saturating_sub(start_tick);
+                    let need = current.map(break_ticks).unwrap_or(u64::MAX);
+                    if held_ticks < need {
+                        debug!(
+                            "connection {id} dig finished too early ({held_ticks}/{need} ticks)"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
         let loaded = world.is_chunk_loaded(ChunkPos::from_world(target.0, target.2));
         if dist > BLOCK_REACH {
             debug!("connection {id} edit out of reach (dist {dist:.1}): {edit:?}");
@@ -809,7 +970,7 @@ impl JavaHandler {
             target.2,
             block.name()
         );
-        if matches!(edit, PendingEdit::Place { .. }) {
+        if matches!(edit, PendingEdit::Place { .. }) && !creative {
             if let Some(player) = self.players.get_mut(id) {
                 let held_index = player.inventory.selected_slot_index();
                 player.inventory.consume_one(held_index);
@@ -845,7 +1006,7 @@ impl JavaHandler {
         }
     }
 
-    pub fn pump_inventory(&mut self, network: &mut NetworkManager) {
+    pub fn pump_drops(&mut self, network: &mut NetworkManager, worlds: &mut WorldManager) {
         let clickers: Vec<(ConnectionId, Vec<PendingClick>)> = self
             .sessions
             .iter_mut()
@@ -854,8 +1015,235 @@ impl JavaHandler {
             .map(|(id, session)| (*id, std::mem::take(&mut session.clicks)))
             .collect();
         for (id, clicks) in clickers {
+            let had_clicks = !clicks.is_empty();
             for click in clicks {
-                self.apply_click(id, click);
+                if let ClickOutcome::Drop(stack) = self.apply_click(id, click) {
+                    self.spawn_drop(id, stack, worlds);
+                }
+            }
+            // Force a full inventory resync after clicks so the client state
+            // id advances even for stale clicks that changed nothing.
+            if had_clicks {
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.sent_state = None;
+                }
+            }
+        }
+        // In-game Q / Ctrl+Q keypresses drop from the held hotbar slot.
+        let key_droppers: Vec<(ConnectionId, Vec<KeyDrop>)> = self
+            .sessions
+            .iter_mut()
+            .filter(|(_, session)| session.state == ProtocolState::Play)
+            .filter(|(_, session)| !session.key_drops.is_empty())
+            .map(|(id, session)| (*id, std::mem::take(&mut session.key_drops)))
+            .collect();
+        for (id, drops) in key_droppers {
+            let mut dirty = false;
+            for drop in drops {
+                let taken = match self.players.get_mut(id) {
+                    Some(player) => {
+                        let held = player.inventory.selected_slot_index();
+                        match drop {
+                            KeyDrop::Single => player.inventory.take(held, 1),
+                            KeyDrop::Stack => player.inventory.take(held, u32::MAX),
+                        }
+                    }
+                    None => None,
+                };
+                if let Some(stack) = taken {
+                    self.spawn_drop(id, stack, worlds);
+                    dirty = true;
+                }
+            }
+            if dirty {
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.inv_dirty = true;
+                    session.sent_state = None;
+                }
+            }
+        }
+        // Creative inventory writes set slots directly; slot -1 with an
+        // item drops it, slot -1 with no item clears the cursor.
+        let creative_writers: Vec<(ConnectionId, Vec<PendingCreativeSlot>)> = self
+            .sessions
+            .iter_mut()
+            .filter(|(_, session)| session.state == ProtocolState::Play)
+            .filter(|(_, session)| !session.creative_slots.is_empty())
+            .map(|(id, session)| (*id, std::mem::take(&mut session.creative_slots)))
+            .collect();
+        for (id, slots) in creative_writers {
+            let mut dirty = false;
+            let mut drops: Vec<ItemStack> = Vec::new();
+            for update in slots {
+                let Some(player) = self.players.get_mut(id) else {
+                    continue;
+                };
+                if !player.is_creative() {
+                    continue;
+                }
+                match update {
+                    _ if update.slot < -1 => {}
+                    PendingCreativeSlot {
+                        slot: -1,
+                        item: Some(stack),
+                    } => drops.push(stack),
+                    PendingCreativeSlot {
+                        slot: -1,
+                        item: None,
+                    } => {
+                        player.cursor = ItemStack::empty();
+                        dirty = true;
+                    }
+                    PendingCreativeSlot { slot, item } => {
+                        let index = usize::try_from(slot).unwrap_or(usize::MAX);
+                        if index < crate::inventory::INVENTORY_SIZE {
+                            let stack = item.unwrap_or_else(ItemStack::empty);
+                            if player.inventory.set(index, stack) {
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+            for stack in drops {
+                self.spawn_drop(id, stack, worlds);
+                dirty = true;
+            }
+            if dirty {
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.inv_dirty = true;
+                    session.sent_state = None;
+                }
+            }
+        }
+        for world in worlds.iter_mut() {
+            let mut remove: Vec<i32> = Vec::new();
+            let count = world.drops().len();
+            for index in 0..count {
+                let id = world.drops()[index].entity.id;
+                world.drops_mut()[index].age += 1;
+                if world.drops()[index].age >= crate::world::DROP_DESPAWN_AGE {
+                    remove.push(id);
+                    continue;
+                }
+                let (x, y, z, vy) = {
+                    let drop = &world.drops()[index];
+                    (drop.entity.x, drop.entity.y, drop.entity.z, drop.entity.vy)
+                };
+                let top = world.ground_top(x, z, y);
+                let drop = &mut world.drops_mut()[index];
+                drop.entity.vy = (vy - GRAVITY_PER_TICK) * AIR_DRAG;
+                if drop.entity.vy < TERMINAL_VELOCITY {
+                    drop.entity.vy = TERMINAL_VELOCITY;
+                }
+                drop.entity.y += drop.entity.vy;
+                if drop.entity.vy < 0.0 {
+                    if let Some(top) = top {
+                        if drop.entity.y <= top {
+                            drop.entity.y = top;
+                            drop.entity.vy = 0.0;
+                        }
+                    }
+                }
+            }
+            for id in remove {
+                world.remove_drop(id);
+            }
+        }
+        let players: Vec<ConnectionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.state == ProtocolState::Play)
+            .map(|(id, _)| *id)
+            .collect();
+        for pid in players {
+            let (world_name, px, py, pz) = match self.players.get(pid) {
+                Some(player) => (player.world.clone(), player.x, player.y, player.z),
+                None => continue,
+            };
+            let mut picked = false;
+            if let Some(world) = worlds.get_mut(&world_name) {
+                let mut index = 0;
+                while index < world.drops().len() {
+                    let (dx, dy, dz, stack) = {
+                        let drop = &world.drops()[index];
+                        (
+                            drop.entity.x - px,
+                            drop.entity.y - py,
+                            drop.entity.z - pz,
+                            drop.stack,
+                        )
+                    };
+                    if dx.hypot(dy).hypot(dz) <= 2.0
+                        && world.drops()[index].age >= crate::world::DROP_PICKUP_DELAY
+                    {
+                        if let Some(player) = self.players.get_mut(pid) {
+                            let leftover = player.inventory.add(stack);
+                            if leftover == 0 {
+                                world.remove_drop(world.drops()[index].entity.id);
+                                picked = true;
+                                continue;
+                            } else {
+                                world.drops_mut()[index].stack.count = leftover;
+                                picked = true;
+                            }
+                        }
+                    }
+                    index += 1;
+                }
+            }
+            if picked {
+                if let Some(session) = self.sessions.get_mut(&pid) {
+                    session.inv_dirty = true;
+                }
+            }
+        }
+        let viewers: Vec<ConnectionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.state == ProtocolState::Play)
+            .map(|(id, _)| *id)
+            .collect();
+        for viewer in viewers {
+            self.pump_drop_visibility(viewer, network, worlds);
+        }
+    }
+
+    pub fn pump_inventory(&mut self, network: &mut NetworkManager) {
+        // Drain inventory clicks here as well so tests (and any path that only
+        // pumps inventory) still apply them. Mode 4 (throw) is left queued for
+        // pump_drops which owns drop spawning. Taking via mem::take makes this
+        // safe when pump_drops already ran first in the server tick.
+        let clickers: Vec<(ConnectionId, Vec<PendingClick>)> = self
+            .sessions
+            .iter_mut()
+            .filter(|(_, session)| session.state == ProtocolState::Play)
+            .filter(|(_, session)| !session.clicks.is_empty())
+            .map(|(id, session)| (*id, std::mem::take(&mut session.clicks)))
+            .collect();
+        for (id, clicks) in clickers {
+            let mut deferred = Vec::new();
+            let mut had_inventory_click = false;
+            for click in clicks {
+                if click.mode == 4 {
+                    deferred.push(click);
+                    continue;
+                }
+                had_inventory_click = true;
+                // Drop outcomes cannot happen for modes 0,1,2; ignore if they do.
+                let _ = self.apply_click(id, click);
+            }
+            if !deferred.is_empty() {
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.clicks.extend(deferred);
+                }
+            }
+            if had_inventory_click {
+                // Clear sent_state so the sync below sends a full container
+                // even when the click changed nothing (stale resync).
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.sent_state = None;
+                }
             }
         }
         let ids: Vec<ConnectionId> = self
@@ -873,20 +1261,56 @@ impl JavaHandler {
                 continue;
             };
             if session.inv_dirty {
-                session.inv_state += 1;
                 let mut slots = [ItemStack::empty(); crate::inventory::INVENTORY_SIZE];
                 for (index, slot) in slots.iter_mut().enumerate() {
                     *slot = player.inventory.get(index).unwrap_or(ItemStack::empty());
                 }
-                send_response(
-                    conn,
-                    &encode_container_content(&slots, player.cursor, session.inv_state),
-                );
+                let cursor = player.cursor;
+                match &session.sent_state {
+                    Some((old_slots, old_cursor))
+                        if *old_cursor == cursor
+                            && slots
+                                .iter()
+                                .zip(old_slots.iter())
+                                .filter(|(a, b)| a != b)
+                                .count()
+                                <= 8 =>
+                    {
+                        let changed: Vec<(usize, ItemStack)> = slots
+                            .iter()
+                            .zip(old_slots.iter())
+                            .enumerate()
+                            .filter(|(_, (a, b))| a != b)
+                            .map(|(index, (stack, _))| (index, *stack))
+                            .collect();
+                        if !changed.is_empty() {
+                            session.inv_state += 1;
+                            let state = session.inv_state;
+                            for (index, stack) in changed {
+                                send_response(
+                                    conn,
+                                    &encode_container_slot(0, state, index as i32, stack),
+                                );
+                            }
+                            session.sent_state = Some((slots, cursor));
+                        }
+                    }
+                    _ => {
+                        session.inv_state += 1;
+                        let state = session.inv_state;
+                        send_response(conn, &encode_container_content(&slots, cursor, state));
+                        session.sent_state = Some((slots, cursor));
+                    }
+                }
                 session.inv_dirty = false;
             }
             if session.held_dirty {
                 send_response(conn, &encode_held_slot(player.inventory.selected()));
                 session.held_dirty = false;
+            }
+            if session.abilities_dirty {
+                send_response(conn, &encode_player_abilities(player.ability_flags()));
+                session.abilities_dirty = false;
             }
             if conn.is_closed() {
                 self.remove_session(id);
@@ -894,31 +1318,216 @@ impl JavaHandler {
         }
     }
 
-    fn apply_click(&mut self, id: ConnectionId, click: PendingClick) {
+    fn apply_click(&mut self, id: ConnectionId, click: PendingClick) -> ClickOutcome {
         let (Some(session), Some(player)) = (self.sessions.get_mut(&id), self.players.get_mut(id))
         else {
-            return;
+            return ClickOutcome::Ignored;
         };
         if click.window != 0 {
-            return;
+            return ClickOutcome::Ignored;
         }
         if click.state != session.inv_state {
             session.inv_dirty = true;
-            return;
+            return ClickOutcome::Ignored;
         }
-        let applied = match click.mode {
-            0 => click_pickup(
+        let outcome = match click.mode {
+            0 => {
+                if click_pickup(
+                    &mut player.inventory,
+                    &mut player.cursor,
+                    click.slot,
+                    click.button,
+                ) {
+                    ClickOutcome::Synced
+                } else {
+                    ClickOutcome::Ignored
+                }
+            }
+            1 => {
+                if click_shift(&mut player.inventory, click.slot) {
+                    ClickOutcome::Synced
+                } else {
+                    ClickOutcome::Ignored
+                }
+            }
+            2 => {
+                if click_swap(&mut player.inventory, click.slot, click.button) {
+                    ClickOutcome::Synced
+                } else {
+                    ClickOutcome::Ignored
+                }
+            }
+            4 => match throw_stack(
                 &mut player.inventory,
                 &mut player.cursor,
                 click.slot,
                 click.button,
-            ),
-            1 => click_shift(&mut player.inventory, click.slot),
-            2 => click_swap(&mut player.inventory, click.slot, click.button),
-            _ => false,
+            ) {
+                Some(stack) => ClickOutcome::Drop(stack),
+                None => ClickOutcome::Ignored,
+            },
+            _ => ClickOutcome::Ignored,
         };
-        if applied {
+        if !matches!(outcome, ClickOutcome::Ignored) {
             session.inv_dirty = true;
+        }
+        outcome
+    }
+
+    fn spawn_drop(&mut self, owner: ConnectionId, stack: ItemStack, worlds: &mut WorldManager) {
+        let (Some(player), Ok(uuid)) = (self.players.get(owner), new_session_id()) else {
+            return;
+        };
+        let (world_name, x, y, z) = (player.world.clone(), player.x, player.y + 0.5, player.z);
+        let Some(world) = worlds.get_mut(&world_name) else {
+            return;
+        };
+        let id = self.entity_id_counter;
+        self.entity_id_counter += 1;
+        world.spawn_drop(Entity::spawn(id, Some(uuid), world_name, x, y, z), stack);
+    }
+
+    fn pump_drop_visibility(
+        &mut self,
+        viewer: ConnectionId,
+        network: &mut NetworkManager,
+        worlds: &WorldManager,
+    ) {
+        let viewer_world = match self.players.get(viewer) {
+            Some(player) => player.world.clone(),
+            None => return,
+        };
+        let sent_chunks = match self.sessions.get(&viewer) {
+            Some(session) => session.sent_chunks.clone(),
+            None => return,
+        };
+        let drops: Vec<(i32, u128, f64, f64, f64, ItemStack)> = match worlds.get(&viewer_world) {
+            Some(world) => world
+                .drops()
+                .iter()
+                .filter(|drop| {
+                    sent_chunks.contains(&ChunkPos::from_world(
+                        drop.entity.x.floor() as i32,
+                        drop.entity.z.floor() as i32,
+                    ))
+                })
+                .map(|drop| {
+                    (
+                        drop.entity.id,
+                        drop.entity.uuid.unwrap_or_default(),
+                        drop.entity.x,
+                        drop.entity.y,
+                        drop.entity.z,
+                        drop.stack,
+                    )
+                })
+                .collect(),
+            None => return,
+        };
+        let tracked: Vec<(i32, TrackedDrop)> = match self.sessions.get(&viewer) {
+            Some(session) => session
+                .drop_tracked
+                .iter()
+                .map(|(id, snap)| (*id, *snap))
+                .collect(),
+            None => return,
+        };
+        let mut despawned: Vec<i32> = tracked
+            .iter()
+            .filter(|(id, _)| !drops.iter().any(|drop| drop.0 == *id))
+            .map(|(id, _)| *id)
+            .collect();
+        despawned.sort_unstable();
+        if !despawned.is_empty() {
+            let Some(conn) = network.connection_mut(viewer) else {
+                return;
+            };
+            for entity_id in &despawned {
+                send_response(conn, &encode_destroy_entities(&[*entity_id]));
+            }
+            if conn.is_closed() {
+                return;
+            }
+            if let Some(session) = self.sessions.get_mut(&viewer) {
+                for entity_id in &despawned {
+                    session.drop_tracked.remove(entity_id);
+                }
+            }
+        }
+        for (id, uuid, x, y, z, stack) in &drops {
+            let last = tracked
+                .iter()
+                .find(|(seen, _)| seen == id)
+                .map(|(_, snap)| *snap);
+            let Some(conn) = network.connection_mut(viewer) else {
+                return;
+            };
+            match last {
+                None => {
+                    send_response(conn, &encode_spawn_item(*id, *uuid, *x, *y, *z));
+                    send_response(
+                        conn,
+                        &encode_entity_metadata(
+                            *id,
+                            &[MetadataEntry {
+                                index: 8,
+                                kind: MetadataKind::Slot(*stack),
+                            }],
+                        ),
+                    );
+                    if conn.is_closed() {
+                        return;
+                    }
+                    if let Some(session) = self.sessions.get_mut(&viewer) {
+                        session.drop_tracked.insert(
+                            *id,
+                            TrackedDrop {
+                                x: *x,
+                                y: *y,
+                                z: *z,
+                                count: stack.count,
+                            },
+                        );
+                    }
+                }
+                Some(previous) if previous.x != *x || previous.y != *y || previous.z != *z => {
+                    send_response(
+                        conn,
+                        &encode_teleport_entity(*id, *x, *y, *z, 0.0, 0.0, false),
+                    );
+                    if conn.is_closed() {
+                        return;
+                    }
+                    if let Some(session) = self.sessions.get_mut(&viewer) {
+                        if let Some(snap) = session.drop_tracked.get_mut(id) {
+                            snap.x = *x;
+                            snap.y = *y;
+                            snap.z = *z;
+                        }
+                    }
+                }
+                Some(previous) if previous.count != stack.count => {
+                    send_response(
+                        conn,
+                        &encode_entity_metadata(
+                            *id,
+                            &[MetadataEntry {
+                                index: 8,
+                                kind: MetadataKind::Slot(*stack),
+                            }],
+                        ),
+                    );
+                    if conn.is_closed() {
+                        return;
+                    }
+                    if let Some(session) = self.sessions.get_mut(&viewer) {
+                        if let Some(snap) = session.drop_tracked.get_mut(id) {
+                            snap.count = stack.count;
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
         }
     }
 
@@ -1102,7 +1711,154 @@ impl JavaHandler {
         session.teleport_id += 1;
         session.state = ProtocolState::Play;
         session.inv_dirty = true;
+        session.abilities_dirty = player.is_creative();
         info!("Player joined: {}", player.name);
+    }
+
+    /// Switches every connected player to `mode` (console command path).
+    pub fn set_gamemode(&mut self, network: &mut NetworkManager, mode: GameMode) {
+        let ids: Vec<ConnectionId> = self.players.iter().map(|p| p.connection_id).collect();
+        if ids.is_empty() {
+            info!("No players online; game mode not changed");
+            return;
+        }
+        let mut switched = 0usize;
+        for id in ids {
+            if self.switch_player_mode(network, id, mode) {
+                switched += 1;
+            }
+        }
+        if switched == 0 {
+            info!("All players already in {mode:?}");
+        }
+    }
+
+    /// Switches one player to `mode`, pushing the game event, player-info
+    /// broadcast and inventory/abilities resync. Returns false when there
+    /// was nothing to do. Spectators fly unconditionally; creative players
+    /// toggle flight themselves via the serverbound abilities packet.
+    /// Leaving those modes clears flight.
+    fn switch_player_mode(
+        &mut self,
+        network: &mut NetworkManager,
+        id: ConnectionId,
+        mode: GameMode,
+    ) -> bool {
+        let Some(player) = self.players.get_mut(id) else {
+            return false;
+        };
+        if player.gamemode == mode {
+            return false;
+        }
+        player.gamemode = mode;
+        player.flying = mode == GameMode::Spectator;
+        // Stash a cursor stack back into the inventory instead of
+        // deleting it; the forced full resync below carries the
+        // resulting state (including any leftover cursor) to the client.
+        if !player.cursor.is_empty() {
+            let cursor = std::mem::replace(&mut player.cursor, ItemStack::empty());
+            let leftover = player.inventory.add(cursor);
+            if leftover > 0 {
+                player.cursor = ItemStack {
+                    item: cursor.item,
+                    count: leftover,
+                };
+            }
+        }
+        let announcement = encode_player_info_add(player.display_uuid(), &player.name, mode as i32);
+        let name = player.name.clone();
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.inv_dirty = true;
+            session.sent_state = None;
+            session.abilities_dirty = true;
+        }
+        if let Some(conn) = network.connection_mut(id) {
+            // Reason 3 tells the client its own game mode changed.
+            send_response(conn, &encode_game_event(3, mode as u8 as f32));
+        }
+        let viewers: Vec<ConnectionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.state == ProtocolState::Play)
+            .map(|(id, _)| *id)
+            .collect();
+        for viewer in viewers {
+            if let Some(conn) = network.connection_mut(viewer) {
+                send_response(conn, &announcement);
+            }
+        }
+        info!("Player {name} switched to {mode:?}");
+        true
+    }
+
+    fn send_chat(&mut self, network: &mut NetworkManager, id: ConnectionId, text: &str) {
+        if let Some(conn) = network.connection_mut(id) {
+            send_response(conn, &encode_system_chat(text));
+        }
+    }
+
+    fn run_chat_command(&mut self, id: ConnectionId, network: &mut NetworkManager, command: &str) {
+        let mut words = command.split_whitespace();
+        match words.next() {
+            Some(word) if word.eq_ignore_ascii_case("gamemode") => {
+                let mode = match words.next().and_then(parse_gamemode) {
+                    Some(mode) => mode,
+                    None => {
+                        self.send_chat(
+                            network,
+                            id,
+                            "Usage: /gamemode <survival|creative|adventure|spectator> [player]",
+                        );
+                        return;
+                    }
+                };
+                let target = match words.next() {
+                    Some(name) => {
+                        let found = self
+                            .players
+                            .find_by_name(name)
+                            .map(|player| player.connection_id);
+                        match found {
+                            Some(target) => target,
+                            None => {
+                                self.send_chat(network, id, "No player was found");
+                                return;
+                            }
+                        }
+                    }
+                    None => id,
+                };
+                if self.players.get(target).is_none() {
+                    return;
+                }
+                let target_name = self.players.get(target).map(|p| p.name.clone());
+                if self.switch_player_mode(network, target, mode) {
+                    let label = match mode {
+                        GameMode::Survival => "Survival Mode",
+                        GameMode::Creative => "Creative Mode",
+                        GameMode::Adventure => "Adventure Mode",
+                        GameMode::Spectator => "Spectator Mode",
+                    };
+                    match target_name {
+                        Some(name) if target != id => {
+                            self.send_chat(
+                                network,
+                                id,
+                                &format!("Set {name}'s game mode to {label}"),
+                            );
+                        }
+                        _ => {
+                            self.send_chat(network, id, &format!("Set own game mode to {label}"));
+                        }
+                    }
+                } else {
+                    self.send_chat(network, id, "That player already has that game mode");
+                }
+            }
+            _ => {
+                self.send_chat(network, id, "Unknown or incomplete command");
+            }
+        }
     }
 }
 
@@ -1137,9 +1893,16 @@ enum PacketAction {
     EnterPlay,
     PlayerAction(i32),
     Edit(PendingEdit),
+    KeyDrop(KeyDrop),
+    ChatCommand(String),
     SelectSlot(u8),
     HeldEcho,
     Click(PendingClick),
+    CreativeSlot {
+        slot: i16,
+        item: Option<ItemStack>,
+    },
+    PlayerAbilities(u8),
     MovePlayer {
         x: f64,
         y: f64,
@@ -1165,6 +1928,7 @@ fn handle_packet(
     id: i32,
     payload: &[u8],
     conn: &mut Connection,
+    tick: u64,
 ) -> Result<PacketAction, ProtoError> {
     match (session.state, id) {
         (ProtocolState::Handshaking, 0x00) => {
@@ -1285,6 +2049,48 @@ fn handle_packet(
             });
         }
         (ProtocolState::Play, 0x21) => {}
+        (ProtocolState::Play, 0x28) => {
+            // Player Abilities: the client reports flying toggles here.
+            let mut reader = Reader::new(payload);
+            if let Ok(flags) = reader.read_u8() {
+                if reader.remaining() == 0 {
+                    return Ok(PacketAction::PlayerAbilities(flags));
+                }
+            }
+            debug!(
+                "connection {} abilities packet with unexpected shape tolerated",
+                session.id
+            );
+        }
+        (ProtocolState::Play, 0x07) => {
+            // Unsigned Chat Command (the server advertises no secure chat,
+            // so commands arrive as a bare string).
+            let mut reader = Reader::new(payload);
+            if let Ok(command) = reader.read_string() {
+                if reader.remaining() == 0 {
+                    return Ok(PacketAction::ChatCommand(command));
+                }
+            }
+            debug!(
+                "connection {} chat command with unexpected shape tolerated",
+                session.id
+            );
+        }
+        (ProtocolState::Play, 0x38) => {
+            // Set Creative Mode Slot: slot -1 with an item drops it into the
+            // world, slot -1 without an item clears the cursor. Only honored
+            // for creative players when pumped.
+            let mut reader = Reader::new(payload);
+            if let (Ok(slot), Some(item)) = (reader.read_i16(), read_slot(&mut reader)) {
+                if reader.remaining() == 0 {
+                    return Ok(PacketAction::CreativeSlot { slot, item });
+                }
+            }
+            debug!(
+                "connection {} creative slot packet with unexpected shape tolerated",
+                session.id
+            );
+        }
         (ProtocolState::Play, 0x2A) => {
             let mut reader = Reader::new(payload);
             if let (Ok(_entity), Ok(action), Ok(_jump)) = (
@@ -1322,13 +2128,25 @@ fn handle_packet(
                 reader.read_varint(),
                 reader.read_varint(),
             ) {
-                if status == 2 && (0..=5).contains(&face) {
-                    return Ok(PacketAction::Edit(PendingEdit::Break {
-                        x: pos.0,
-                        y: pos.1,
-                        z: pos.2,
-                        sequence,
-                    }));
+                // Q / Ctrl+Q drop actions carry padding position/face, so
+                // handle them before the face-range check for dig actions.
+                if status == 3 {
+                    return Ok(PacketAction::KeyDrop(KeyDrop::Stack));
+                }
+                if status == 4 {
+                    return Ok(PacketAction::KeyDrop(KeyDrop::Single));
+                }
+                if (0..=6).contains(&status) && (0..=5).contains(&face) {
+                    if status == 2 {
+                        return Ok(PacketAction::Edit(PendingEdit::Break {
+                            x: pos.0,
+                            y: pos.1,
+                            z: pos.2,
+                            sequence,
+                            start_tick: tick,
+                        }));
+                    }
+                    return Ok(PacketAction::None);
                 }
             }
             debug!(
@@ -1599,6 +2417,45 @@ fn click_shift(inventory: &mut Inventory, slot: i32) -> bool {
         inventory.set(index, rest);
     }
     true
+}
+
+fn throw_stack(
+    inventory: &mut Inventory,
+    cursor: &mut ItemStack,
+    slot: i32,
+    button: u8,
+) -> Option<ItemStack> {
+    if slot == -999 {
+        if cursor.is_empty() {
+            return None;
+        }
+        if button == 1 {
+            let single = ItemStack {
+                item: cursor.item,
+                count: 1,
+            };
+            cursor.count -= 1;
+            if cursor.count == 0 {
+                *cursor = ItemStack::empty();
+            }
+            return Some(single);
+        }
+        if button == 0 {
+            let stack = *cursor;
+            *cursor = ItemStack::empty();
+            return Some(stack);
+        }
+        return None;
+    }
+    if !(0..crate::inventory::INVENTORY_SIZE as i32).contains(&slot) {
+        return None;
+    }
+    let index = slot as usize;
+    match button {
+        0 => inventory.take(index, 1),
+        1 => inventory.take(index, u32::MAX),
+        _ => None,
+    }
 }
 
 fn click_swap(inventory: &mut Inventory, slot: i32, button: u8) -> bool {
@@ -2888,7 +3745,7 @@ mod tests {
 
         send_dig(&mut first, 2, 0, 64, 0, 1, 7);
         settle(&mut stack);
-        stack.1.pump_blocks(&mut stack.0, &mut worlds);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
         assert_eq!(
             worlds
                 .get(crate::world::DEFAULT_WORLD_NAME)
@@ -2919,7 +3776,7 @@ mod tests {
 
         send_dig(&mut first, 2, 0, 70, 0, 1, 1);
         settle(&mut stack);
-        stack.1.pump_blocks(&mut stack.0, &mut worlds);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
         let (id, payload) = first.read_packet();
         assert_eq!(id, 0x08);
         let mut reader = Reader::new(&payload);
@@ -2928,13 +3785,13 @@ mod tests {
 
         send_dig(&mut first, 2, 500, 64, 500, 1, 2);
         settle(&mut stack);
-        stack.1.pump_blocks(&mut stack.0, &mut worlds);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
         expect_silence(&mut first);
 
         stack.1.players.get_mut(1).unwrap().x = 100.0;
         send_dig(&mut first, 2, 0, 64, 0, 1, 3);
         settle(&mut stack);
-        stack.1.pump_blocks(&mut stack.0, &mut worlds);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
         expect_silence(&mut first);
         assert_eq!(
             worlds
@@ -2955,7 +3812,7 @@ mod tests {
 
         send_place(&mut first, 0, 64, 0, 1, 11);
         settle(&mut stack);
-        stack.1.pump_blocks(&mut stack.0, &mut worlds);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
         assert_eq!(
             worlds
                 .get(crate::world::DEFAULT_WORLD_NAME)
@@ -2976,7 +3833,7 @@ mod tests {
 
         send_place(&mut first, 0, 63, 0, 1, 12);
         settle(&mut stack);
-        stack.1.pump_blocks(&mut stack.0, &mut worlds);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
         let (id, payload) = first.read_packet();
         assert_eq!(id, 0x08);
         let mut reader = Reader::new(&payload);
@@ -2985,7 +3842,7 @@ mod tests {
 
         send_place(&mut first, 0, 67, 0, 1, 13);
         settle(&mut stack);
-        stack.1.pump_blocks(&mut stack.0, &mut worlds);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
         let (id, payload) = first.read_packet();
         assert_eq!(id, 0x08);
         let mut reader = Reader::new(&payload);
@@ -3021,7 +3878,7 @@ mod tests {
 
         send_dig(&mut first, 2, 0, 64, 0, 1, 21);
         settle(&mut stack);
-        stack.1.pump_blocks(&mut stack.0, &mut worlds);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
         let (id, _) = first.read_packet();
         assert_eq!(id, 0x04);
         let (id, _) = first.read_packet();
@@ -3109,7 +3966,7 @@ mod tests {
         assert!(stack.1.players.get(1).unwrap().held_item().is_empty());
         send_place(&mut first, 0, 64, 0, 1, 31);
         settle(&mut stack);
-        stack.1.pump_blocks(&mut stack.0, &mut worlds);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
         expect_silence(&mut first);
         assert_eq!(
             worlds
@@ -3331,6 +4188,266 @@ mod tests {
         settle(&mut stack);
         assert_eq!(stack.0.connection_count(), 1);
         assert_eq!(stack.1.player_count(), 1);
+    }
+
+    #[test]
+    fn dig_timing_requires_hold_time() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        seed_visible(&mut stack, 1);
+        let mut worlds = lowered_worlds(&mut stack);
+        stack.1.players.get_mut(1).unwrap().y = 65.0;
+
+        send_dig(&mut first, 2, 0, 64, 0, 1, 50);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1);
+        expect_silence(&mut first);
+        assert_eq!(
+            worlds
+                .get(crate::world::DEFAULT_WORLD_NAME)
+                .unwrap()
+                .get_block(0, 64, 0),
+            Some(crate::world::Block::GrassBlock)
+        );
+
+        send_dig(&mut first, 2, 0, 64, 0, 1, 51);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 16);
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x04);
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x08);
+
+        send_dig(&mut first, 2, 0, 60, 0, 1, 52);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 100);
+        expect_silence(&mut first);
+        send_dig(&mut first, 2, 0, 60, 0, 1, 53);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 200);
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x04);
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x08);
+    }
+
+    #[test]
+    fn throw_spawns_pickup_and_despawn() {
+        let mut stack = test_stack();
+        let (mut first, mut second) = join_pair(&mut stack);
+        seed_visible(&mut stack, 1);
+        seed_visible(&mut stack, 2);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+        read_content(&mut second);
+        let mut worlds = lowered_worlds(&mut stack);
+        stack.1.players.get_mut(1).unwrap().y = 65.0;
+
+        let mut body = Writer::new();
+        body.write_varint(0);
+        body.write_varint(1);
+        body.write_i16(36);
+        body.write_u8(1);
+        body.write_varint(4);
+        body.write_varint(0);
+        write_hashed(&mut body, false, 0, 0);
+        first.send_packet(0x12, &body.into_bytes());
+        settle(&mut stack);
+        stack.1.pump_drops(&mut stack.0, &mut worlds);
+        assert_eq!(worlds.get("world").unwrap().drops().len(), 1);
+        assert!(stack
+            .1
+            .players
+            .get(1)
+            .unwrap()
+            .inventory
+            .get(36)
+            .unwrap()
+            .is_empty());
+        let (id, payload) = second.read_packet();
+        assert_eq!(id, 0x01);
+        assert_eq!(Reader::new(&payload).read_varint().unwrap(), 3);
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x63);
+
+        for _ in 0..15 {
+            stack.1.pump_drops(&mut stack.0, &mut worlds);
+            if worlds.get("world").unwrap().drops().is_empty() {
+                break;
+            }
+        }
+        assert!(worlds.get("world").unwrap().drops().is_empty());
+        assert_eq!(
+            stack.1.players.get(1).unwrap().inventory.get(0).unwrap(),
+            crate::inventory::ItemStack::new(crate::inventory::Item::Stone, 64).unwrap()
+        );
+        let mut saw_teleport = false;
+        for _ in 0..15 {
+            let (id, _) = second.read_packet();
+            if id == 0x4D {
+                break;
+            }
+            assert_eq!(id, 0x7D);
+            saw_teleport = true;
+        }
+        assert!(saw_teleport);
+
+        let mut body = Writer::new();
+        body.write_varint(0);
+        body.write_varint(1);
+        body.write_i16(0);
+        body.write_u8(1);
+        body.write_varint(4);
+        body.write_varint(0);
+        write_hashed(&mut body, false, 0, 0);
+        first.send_packet(0x12, &body.into_bytes());
+        settle(&mut stack);
+        stack.1.pump_drops(&mut stack.0, &mut worlds);
+        assert_eq!(worlds.get("world").unwrap().drops().len(), 1);
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x01);
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x63);
+        worlds.get_mut("world").unwrap().drops_mut()[0].age = 5999;
+        stack.1.players.get_mut(1).unwrap().x = 5000.0;
+        stack.1.pump_drops(&mut stack.0, &mut worlds);
+        assert!(worlds.get("world").unwrap().drops().is_empty());
+        for _ in 0..15 {
+            let (id, _) = second.read_packet();
+            if id == 0x4D {
+                break;
+            }
+            assert!(id == 0x7D || id == 0x63);
+        }
+    }
+
+    #[test]
+    fn q_key_drops_single_from_held() {
+        let mut stack = test_stack();
+        let (mut first, mut second) = join_pair(&mut stack);
+        seed_visible(&mut stack, 1);
+        seed_visible(&mut stack, 2);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+        read_content(&mut second);
+        let mut worlds = lowered_worlds(&mut stack);
+        stack.1.players.get_mut(1).unwrap().y = 65.0;
+
+        send_dig(&mut first, 4, 0, 64, 0, 1, 60);
+        settle(&mut stack);
+        stack.1.pump_drops(&mut stack.0, &mut worlds);
+        assert_eq!(
+            stack
+                .1
+                .players
+                .get(1)
+                .unwrap()
+                .inventory
+                .get(36)
+                .unwrap()
+                .count,
+            63
+        );
+        assert_eq!(worlds.get("world").unwrap().drops().len(), 1);
+        assert_eq!(worlds.get("world").unwrap().drops()[0].stack.count, 1);
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x01);
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x63);
+        // Owner sees the spawn too, then the forced full inventory resync.
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x01);
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x63);
+        stack.1.pump_inventory(&mut stack.0);
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x12);
+    }
+
+    #[test]
+    fn ctrl_q_key_drops_whole_held_stack() {
+        let mut stack = test_stack();
+        let (mut first, mut second) = join_pair(&mut stack);
+        seed_visible(&mut stack, 1);
+        seed_visible(&mut stack, 2);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+        read_content(&mut second);
+        let mut worlds = lowered_worlds(&mut stack);
+        stack.1.players.get_mut(1).unwrap().y = 65.0;
+
+        send_dig(&mut first, 3, 0, 64, 0, 1, 61);
+        settle(&mut stack);
+        stack.1.pump_drops(&mut stack.0, &mut worlds);
+        assert!(stack
+            .1
+            .players
+            .get(1)
+            .unwrap()
+            .inventory
+            .get(36)
+            .unwrap()
+            .is_empty());
+        assert_eq!(worlds.get("world").unwrap().drops().len(), 1);
+        assert_eq!(worlds.get("world").unwrap().drops()[0].stack.count, 64);
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x01);
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x63);
+    }
+
+    #[test]
+    fn q_key_with_empty_hand_spawns_nothing() {
+        let mut stack = test_stack();
+        let (mut first, mut second) = join_pair(&mut stack);
+        seed_visible(&mut stack, 1);
+        seed_visible(&mut stack, 2);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+        read_content(&mut second);
+        let mut worlds = lowered_worlds(&mut stack);
+
+        send_held(&mut first, 5);
+        settle(&mut stack);
+        assert!(stack.1.players.get(1).unwrap().held_item().is_empty());
+        send_dig(&mut first, 4, 0, 64, 0, 1, 62);
+        settle(&mut stack);
+        stack.1.pump_drops(&mut stack.0, &mut worlds);
+        assert!(worlds.get("world").unwrap().drops().is_empty());
+        expect_silence(&mut second);
+    }
+
+    #[test]
+    fn inventory_sync_uses_deltas_for_single_slots() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+
+        stack.1.players.get_mut(1).unwrap().inventory.set(
+            9,
+            crate::inventory::ItemStack::new(crate::inventory::Item::Dirt, 5).unwrap(),
+        );
+        stack.1.sessions.get_mut(&1).unwrap().inv_dirty = true;
+        stack.1.pump_inventory(&mut stack.0);
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x14);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.read_varint().unwrap(), 2);
+        assert_eq!(reader.read_i16().unwrap(), 9);
+        assert_eq!(reader.read_varint().unwrap(), 5);
+
+        for index in 10..20 {
+            stack.1.players.get_mut(1).unwrap().inventory.set(
+                index,
+                crate::inventory::ItemStack::new(crate::inventory::Item::Dirt, 1).unwrap(),
+            );
+        }
+        stack.1.sessions.get_mut(&1).unwrap().inv_dirty = true;
+        stack.1.pump_inventory(&mut stack.0);
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x12);
     }
 
     #[test]
@@ -3653,6 +4770,327 @@ mod tests {
         let (id, payload) = client.read_packet();
         assert_eq!(id, 0x01);
         assert_eq!(Reader::new(&payload).read_i64().unwrap(), 42);
+    }
+
+    fn set_gamemode(
+        stack: &mut (NetworkManager, JavaHandler, std::net::SocketAddr),
+        mode: GameMode,
+    ) {
+        stack.1.set_gamemode(&mut stack.0, mode);
+        stack.1.pump_inventory(&mut stack.0);
+    }
+
+    fn read_gamemode_switch(client: &mut ScriptClient, mode: GameMode) {
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x26); // game event: change game mode
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_u8().unwrap(), 3);
+        assert_eq!(reader.read_f32().unwrap(), mode as u8 as f32);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x46); // player info update broadcast
+    }
+
+    #[test]
+    fn creative_join_sends_abilities_and_break_is_instant() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "CreatorPlayer");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        set_gamemode(&mut stack, GameMode::Creative);
+        read_gamemode_switch(&mut client, GameMode::Creative);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x12); // full container resync
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x40); // abilities: allow flying, instant build
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_u8().unwrap(), 0x0C);
+        assert_eq!(reader.read_f32().unwrap(), 0.05); // flying speed
+        assert_eq!(reader.read_f32().unwrap(), 0.1); // fov modifier
+        assert_eq!(reader.remaining(), 0);
+
+        // Creative digging needs no hold time.
+        let mut worlds = WorldManager::create_default();
+        worlds
+            .get_mut(DEFAULT_WORLD_NAME)
+            .unwrap()
+            .load_chunk(ChunkPos::new(0, 0));
+        stack.1.players.get_mut(1).unwrap().y = 66.0;
+        send_dig(&mut client, 2, 0, 64, 0, 1, 5);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
+        assert_eq!(
+            worlds.get(DEFAULT_WORLD_NAME).unwrap().get_block(0, 64, 0),
+            Some(crate::world::Block::Air)
+        );
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x04);
+        assert_eq!(Reader::new(&payload).read_varint().unwrap(), 5);
+    }
+
+    #[test]
+    fn creative_place_does_not_consume_and_flight_ignores_gravity() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "FlyingPlayer");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        set_gamemode(&mut stack, GameMode::Creative);
+        read_gamemode_switch(&mut client, GameMode::Creative);
+        client.read_packet(); // container resync
+        client.read_packet(); // abilities
+
+        // Held stone survives placement in creative.
+        let mut worlds = WorldManager::create_default();
+        worlds
+            .get_mut(DEFAULT_WORLD_NAME)
+            .unwrap()
+            .load_chunk(ChunkPos::new(0, 0));
+        stack.1.players.get_mut(1).unwrap().y = 66.0;
+        send_place(&mut client, 0, 64, 0, 1, 9);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
+        assert_eq!(
+            worlds.get(DEFAULT_WORLD_NAME).unwrap().get_block(0, 65, 0),
+            Some(crate::world::Block::Stone)
+        );
+        let player = stack.1.players.get(1).unwrap();
+        assert_eq!(player.inventory.get(36).unwrap().count, 64);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x04); // place ack
+
+        // A flying player keeps their height; no gravity correction.
+        let mut abilities = Writer::new();
+        abilities.write_u8(0x02); // flying
+        client.send_packet(0x28, &abilities.into_bytes());
+        settle(&mut stack);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x40); // abilities echo
+        stack.1.players.get_mut(1).unwrap().y = 90.0;
+        let mut move_body = Writer::new();
+        move_body.write_f64(0.5);
+        move_body.write_f64(90.0);
+        move_body.write_f64(0.5);
+        move_body.write_f32(0.0);
+        move_body.write_f32(0.0);
+        move_body.write_u8(1);
+        send_move(&mut client, 0x1F, &move_body.into_bytes());
+        settle(&mut stack);
+        for _ in 0..5 {
+            stack.1.tick_physics(&mut stack.0, &worlds);
+        }
+        expect_silence(&mut client);
+        assert!((stack.1.players.get(1).unwrap().y - 90.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn creative_slot_sets_clears_and_drops() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "SlotPlayer");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        set_gamemode(&mut stack, GameMode::Creative);
+        read_gamemode_switch(&mut client, GameMode::Creative);
+        client.read_packet(); // container resync
+        client.read_packet(); // abilities
+        let mut worlds = lowered_worlds(&mut stack);
+        stack.1.players.get_mut(1).unwrap().y = 100.0;
+
+        // Slot 9 (non-hotbar) is created with 8 dirt.
+        let mut slot = Writer::new();
+        slot.write_i16(9);
+        slot.write_varint(8);
+        slot.write_varint(crate::inventory::Item::Dirt.id());
+        slot.write_varint(0); // added components
+        slot.write_varint(0); // removed components
+        client.send_packet(0x38, &slot.into_bytes());
+        settle(&mut stack);
+        stack.1.pump_drops(&mut stack.0, &mut worlds);
+        assert_eq!(
+            stack.1.players.get(1).unwrap().inventory.get(9).unwrap(),
+            ItemStack::new(crate::inventory::Item::Dirt, 8).unwrap()
+        );
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut client);
+
+        // Overwriting with empty clears the slot.
+        let mut clear = Writer::new();
+        clear.write_i16(9);
+        clear.write_varint(0); // empty slot
+        client.send_packet(0x38, &clear.into_bytes());
+        settle(&mut stack);
+        stack.1.pump_drops(&mut stack.0, &mut worlds);
+        assert!(stack
+            .1
+            .players
+            .get(1)
+            .unwrap()
+            .inventory
+            .get(9)
+            .unwrap()
+            .is_empty());
+
+        // Slot -1 with an item drops it into the world.
+        let mut drop = Writer::new();
+        drop.write_i16(-1);
+        drop.write_varint(3);
+        drop.write_varint(crate::inventory::Item::Stone.id());
+        drop.write_varint(0);
+        drop.write_varint(0);
+        client.send_packet(0x38, &drop.into_bytes());
+        settle(&mut stack);
+        stack.1.pump_drops(&mut stack.0, &mut worlds);
+        assert_eq!(worlds.get(DEFAULT_WORLD_NAME).unwrap().drops().len(), 1);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut client);
+    }
+
+    #[test]
+    fn survival_players_ignore_creative_slot_packets() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "Survivor");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+
+        let mut slot = Writer::new();
+        slot.write_i16(9);
+        slot.write_varint(8);
+        slot.write_varint(crate::inventory::Item::Dirt.id());
+        slot.write_varint(0);
+        slot.write_varint(0);
+        client.send_packet(0x38, &slot.into_bytes());
+        settle(&mut stack);
+        stack
+            .1
+            .pump_drops(&mut stack.0, &mut WorldManager::create_default());
+        assert!(stack
+            .1
+            .players
+            .get(1)
+            .unwrap()
+            .inventory
+            .get(9)
+            .unwrap()
+            .is_empty());
+    }
+
+    fn send_chat(client: &mut ScriptClient, command: &str) {
+        let mut body = Writer::new();
+        body.write_string(command);
+        client.send_packet(0x07, &body.into_bytes());
+    }
+
+    fn read_system_chat(client: &mut ScriptClient) -> String {
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x79);
+        let mut reader = Reader::new(&payload);
+        let tag = crate::java::nbt::NbtTag::decode_unnamed(&mut reader).unwrap();
+        assert!(!reader.read_bool().unwrap());
+        assert_eq!(reader.remaining(), 0);
+        match tag {
+            crate::java::nbt::NbtTag::String(text) => text,
+            _ => panic!("system chat content must be plain text"),
+        }
+    }
+
+    #[test]
+    fn chat_gamemode_switches_self_with_feedback() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "ChatPlayer");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+
+        send_chat(&mut client, "gamemode creative");
+        settle(&mut stack);
+        assert_eq!(stack.1.players.get(1).unwrap().gamemode, GameMode::Creative);
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x26);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_u8().unwrap(), 3);
+        assert_eq!(reader.read_f32().unwrap(), 1.0);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x46); // info broadcast
+        assert!(read_system_chat(&mut client).contains("Creative"));
+        // pump_one already flushed abilities during settle.
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x40);
+        stack.1.pump_inventory(&mut stack.0);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x12);
+    }
+
+    #[test]
+    fn chat_gamemode_rejects_bad_input_without_switching() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "ChatTyper");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut client);
+
+        send_chat(&mut client, "gamemode");
+        settle(&mut stack);
+        assert!(read_system_chat(&mut client).contains("Usage"));
+        send_chat(&mut client, "dance");
+        settle(&mut stack);
+        assert!(read_system_chat(&mut client).contains("Unknown"));
+        send_chat(&mut client, "gamemode creative NobodyOnline");
+        settle(&mut stack);
+        assert!(read_system_chat(&mut client).contains("No player"));
+        assert_eq!(stack.1.players.get(1).unwrap().gamemode, GameMode::Survival);
+        stack.1.pump_inventory(&mut stack.0);
+        expect_silence(&mut client);
+    }
+
+    #[test]
+    fn chat_gamemode_targets_other_player() {
+        let mut stack = test_stack();
+        let (mut first, mut second) = join_pair(&mut stack);
+        stack.1.pump_inventory(&mut stack.0);
+        read_content(&mut first);
+        read_content(&mut second);
+
+        send_chat(&mut first, "gamemode creative SecondPlayer");
+        settle(&mut stack);
+        assert_eq!(stack.1.players.get(1).unwrap().gamemode, GameMode::Survival);
+        assert_eq!(stack.1.players.get(2).unwrap().gamemode, GameMode::Creative);
+        // The sender also gets the info broadcast as a viewer.
+        let (id, _) = first.read_packet();
+        assert_eq!(id, 0x46);
+        assert!(read_system_chat(&mut first).contains("SecondPlayer"));
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x26); // target learns its new mode
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x46);
+        // pump_one already flushed abilities during settle.
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x40);
+        stack.1.pump_inventory(&mut stack.0);
+        expect_silence(&mut first);
+        let (id, _) = second.read_packet();
+        assert_eq!(id, 0x12);
     }
 
     #[test]

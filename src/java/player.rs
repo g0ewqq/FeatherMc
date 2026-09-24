@@ -40,6 +40,7 @@ pub struct PlayerSession {
     pub on_ground: bool,
     pub sneaking: bool,
     pub sprinting: bool,
+    pub flying: bool,
     pub inventory: Inventory,
     pub cursor: ItemStack,
 }
@@ -75,6 +76,7 @@ impl PlayerSession {
             on_ground: false,
             sneaking: false,
             sprinting: false,
+            flying: false,
             inventory: Inventory::starting(),
             cursor: ItemStack::empty(),
         }
@@ -83,6 +85,39 @@ impl PlayerSession {
     #[must_use]
     pub fn held_item(&self) -> ItemStack {
         self.inventory.held()
+    }
+
+    /// Server-side ability flags sent to the client. Creative players may
+    /// fly and are flagged as instant builders; they are not made
+    /// invulnerable because combat/damage is not implemented. Spectators
+    /// fly and are invulnerable, matching vanilla.
+    #[must_use]
+    pub fn ability_flags(&self) -> u8 {
+        use super::packets::{
+            ABILITY_ALLOW_FLYING, ABILITY_FLYING, ABILITY_INSTANT_BUILD, ABILITY_INVULNERABLE,
+        };
+        match self.gamemode {
+            GameMode::Creative => {
+                let mut flags = ABILITY_ALLOW_FLYING | ABILITY_INSTANT_BUILD;
+                if self.flying {
+                    flags |= ABILITY_FLYING;
+                }
+                flags
+            }
+            GameMode::Spectator => ABILITY_INVULNERABLE | ABILITY_ALLOW_FLYING | ABILITY_FLYING,
+            GameMode::Survival | GameMode::Adventure => 0,
+        }
+    }
+
+    #[must_use]
+    pub fn is_creative(&self) -> bool {
+        self.gamemode == GameMode::Creative
+    }
+
+    /// True when the player is exempt from gravity and ground collision.
+    #[must_use]
+    pub fn is_flying_exempt(&self) -> bool {
+        self.gamemode == GameMode::Spectator || (self.gamemode == GameMode::Creative && self.flying)
     }
 
     #[must_use]
@@ -169,6 +204,37 @@ mod tests {
         assert_eq!(session.entity_flags(), 0x0A);
         let named = PlayerSession::new(2, "Steve".to_owned(), Some(7777), 776, 6, 2222);
         assert_eq!(named.display_uuid(), 7777);
+    }
+
+    #[test]
+    fn creative_reports_abilities_and_flight_exemption() {
+        let mut session = PlayerSession::new(1, "Creative".to_owned(), None, 776, 1, 111);
+        session.gamemode = GameMode::Creative;
+        session.flying = true;
+        assert!(session.is_creative());
+        assert_eq!(session.ability_flags(), 0x04 | 0x08 | 0x02);
+        assert!(session.is_flying_exempt());
+
+        session.flying = false;
+        assert_eq!(session.ability_flags(), 0x04 | 0x08);
+        assert!(!session.is_flying_exempt());
+    }
+
+    #[test]
+    fn survival_has_no_abilities() {
+        let session = PlayerSession::new(1, "Survival".to_owned(), None, 776, 1, 222);
+        assert!(!session.is_creative());
+        assert!(!session.flying);
+        assert_eq!(session.ability_flags(), 0);
+        assert!(!session.is_flying_exempt());
+    }
+
+    #[test]
+    fn spectator_always_flies_and_is_invulnerable() {
+        let mut session = PlayerSession::new(1, "Spec".to_owned(), None, 776, 1, 333);
+        session.gamemode = GameMode::Spectator;
+        assert_eq!(session.ability_flags(), 0x01 | 0x04 | 0x02);
+        assert!(session.is_flying_exempt());
     }
 
     #[test]

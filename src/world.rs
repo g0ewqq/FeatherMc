@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use crate::entity::Entity;
+use crate::inventory::ItemStack;
+
 pub const DEFAULT_WORLD_NAME: &str = "world";
 pub const DEFAULT_DIMENSION_ID: &str = "minecraft:overworld";
 
@@ -334,6 +337,15 @@ impl ChunkManager {
     }
 }
 
+pub struct DroppedItem {
+    pub entity: Entity,
+    pub stack: ItemStack,
+    pub age: u64,
+}
+
+pub const DROP_DESPAWN_AGE: u64 = 6000;
+pub const DROP_PICKUP_DELAY: u64 = 10;
+
 pub struct World {
     name: String,
     dimension: String,
@@ -341,6 +353,7 @@ pub struct World {
     height: i32,
     spawn: Spawn,
     chunks: ChunkManager,
+    drops: Vec<DroppedItem>,
 }
 
 impl World {
@@ -353,6 +366,38 @@ impl World {
             height: WORLD_HEIGHT,
             spawn: Spawn::default_spawn(),
             chunks: ChunkManager::new(),
+            drops: Vec::new(),
+        }
+    }
+
+    pub fn spawn_drop(&mut self, entity: Entity, stack: ItemStack) {
+        self.drops.push(DroppedItem {
+            entity,
+            stack,
+            age: 0,
+        });
+    }
+
+    #[must_use]
+    pub fn drops(&self) -> &[DroppedItem] {
+        &self.drops
+    }
+
+    pub fn drops_mut(&mut self) -> &mut Vec<DroppedItem> {
+        &mut self.drops
+    }
+
+    pub fn remove_drop(&mut self, entity_id: i32) -> bool {
+        match self
+            .drops
+            .iter()
+            .position(|drop| drop.entity.id == entity_id)
+        {
+            Some(index) => {
+                self.drops.swap_remove(index);
+                true
+            }
+            None => false,
         }
     }
 
@@ -525,6 +570,10 @@ impl WorldManager {
     pub fn names(&self) -> Vec<String> {
         self.worlds.keys().cloned().collect()
     }
+
+    pub fn iter_mut(&mut self) -> std::collections::hash_map::ValuesMut<'_, String, World> {
+        self.worlds.values_mut()
+    }
 }
 
 #[cfg(test)]
@@ -694,6 +743,24 @@ mod tests {
         assert!(Block::Stone.is_solid());
         assert!(Block::GrassBlock.is_solid());
         assert!(!Block::Air.is_solid());
+    }
+
+    #[test]
+    fn drops_spawn_age_and_remove() {
+        use crate::entity::Entity;
+
+        let mut world = World::default_world();
+        assert!(world.drops().is_empty());
+        world.spawn_drop(
+            Entity::spawn(11, None, "world".to_owned(), 1.0, 65.0, 2.0),
+            ItemStack::new(crate::inventory::Item::Dirt, 3).unwrap(),
+        );
+        assert_eq!(world.drops().len(), 1);
+        assert_eq!(world.drops()[0].stack.count, 3);
+        assert_eq!(world.drops()[0].age, 0);
+        assert!(!world.remove_drop(99));
+        assert!(world.remove_drop(11));
+        assert!(world.drops().is_empty());
     }
 
     #[test]

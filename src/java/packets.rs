@@ -1,4 +1,5 @@
 use super::error::ProtoError;
+use super::nbt::NbtTag;
 use super::player::PlayerSession;
 use super::proto::{Reader, Writer};
 use crate::inventory::{ItemStack, INVENTORY_SIZE};
@@ -188,6 +189,37 @@ pub fn encode_game_event(event: u8, value: f32) -> Vec<u8> {
     body.write_u8(event);
     body.write_f32(value);
     encode_packet(0x26, &body.into_bytes())
+}
+
+/// Ability flag bits shared by the clientbound and serverbound
+/// Player Abilities packets.
+pub const ABILITY_INVULNERABLE: u8 = 0x01;
+pub const ABILITY_FLYING: u8 = 0x02;
+pub const ABILITY_ALLOW_FLYING: u8 = 0x04;
+pub const ABILITY_INSTANT_BUILD: u8 = 0x08;
+
+/// Tells the client which abilities are active. Sent on play entry for
+/// creative players and whenever the flying state changes.
+pub fn encode_player_abilities(flags: u8) -> Vec<u8> {
+    let mut body = Writer::new();
+    body.write_u8(flags);
+    body.write_f32(0.05); // flying speed
+    body.write_f32(0.1); // field of view modifier
+    encode_packet(0x40, &body.into_bytes())
+}
+
+/// Overlay-free system chat line. The content is a plain-text component
+/// sent as an NBT string tag, which vanilla renders directly in chat.
+pub fn encode_system_chat(text: &str) -> Vec<u8> {
+    let mut body = Writer::new();
+    if NbtTag::String(text.to_owned())
+        .encode_unnamed(&mut body)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    body.write_bool(false);
+    encode_packet(0x79, &body.into_bytes())
 }
 
 pub fn encode_block_update(x: i32, y: i32, z: i32, state: i32) -> Vec<u8> {
@@ -667,6 +699,33 @@ mod tests {
         let mut reader = Reader::new(&bytes[header..header + len as usize]);
         assert_eq!(reader.read_varint().unwrap(), 0x2C);
         assert_eq!(reader.read_i64().unwrap(), 987654321);
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn player_abilities_encodes_flags() {
+        let bytes = encode_player_abilities(0x0E);
+        let (len, header) = decode_varint_prefix(&bytes).unwrap().unwrap();
+        let mut reader = Reader::new(&bytes[header..header + len as usize]);
+        assert_eq!(reader.read_varint().unwrap(), 0x40);
+        assert_eq!(reader.read_u8().unwrap(), 0x0E);
+        assert_eq!(reader.read_f32().unwrap(), 0.05); // flying speed
+        assert_eq!(reader.read_f32().unwrap(), 0.1); // field of view modifier
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn system_chat_encodes_plain_text_without_overlay() {
+        let bytes = encode_system_chat("Hello there");
+        let (len, header) = decode_varint_prefix(&bytes).unwrap().unwrap();
+        let mut reader = Reader::new(&bytes[header..header + len as usize]);
+        assert_eq!(reader.read_varint().unwrap(), 0x79);
+        let tag = crate::java::nbt::NbtTag::decode_unnamed(&mut reader).unwrap();
+        assert_eq!(
+            tag,
+            crate::java::nbt::NbtTag::String("Hello there".to_owned())
+        );
+        assert!(!reader.read_bool().unwrap());
         assert_eq!(reader.remaining(), 0);
     }
 
