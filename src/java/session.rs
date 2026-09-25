@@ -2139,10 +2139,6 @@ fn finite_or_keep_angle(value: f32, fallback: f32) -> f32 {
     }
 }
 
-/// Serverbound id for unsigned player chat (protocol 776). Derived from the
-/// 1.20.x table shifted by +3, which is the offset `/help` confirms for
-/// Chat Command (0x04 -> 0x07). Remove the probe below once verified.
-const PLAY_CHAT_MESSAGE: i32 = 0x08;
 /// Chat is untrusted input, so cap it before it goes anywhere.
 const MAX_CHAT_LEN: usize = 256;
 
@@ -2316,13 +2312,28 @@ fn handle_packet(
                 session.id
             );
         }
-        (ProtocolState::Play, PLAY_CHAT_MESSAGE) => {
-            // Unsigned player chat: a bare message string, same shape as a
-            // chat command but without the leading slash.
+        (ProtocolState::Play, 0x09) => {
+            // Signed Chat Message: the text plus timestamp, salt, an
+            // optional 256-byte signature and the last-seen ack set.
+            // Signatures are not verified (offline mode, no Mojang keys);
+            // the message is relayed on a best-effort basis.
             let mut reader = Reader::new(payload);
-            if let Ok(message) = reader.read_string() {
-                if reader.remaining() == 0 {
-                    return Ok(PacketAction::ChatMessage(message));
+            if let (Ok(message), Ok(_), Ok(_)) =
+                (reader.read_string(), reader.read_i64(), reader.read_i64())
+            {
+                let signature_ok = match reader.read_bool() {
+                    Ok(true) => reader.read_bytes(256).is_ok(),
+                    Ok(false) => true,
+                    Err(_) => false,
+                };
+                if signature_ok {
+                    if let (Ok(_), Ok(_), Ok(_)) =
+                        (reader.read_varint(), reader.read_bytes(3), reader.read_u8())
+                    {
+                        if reader.remaining() == 0 {
+                            return Ok(PacketAction::ChatMessage(message));
+                        }
+                    }
                 }
             }
             debug!(
@@ -2491,18 +2502,7 @@ fn handle_packet(
         // this point, so dropping the connection just shows up client-side as
         // "Connection reset".
         (ProtocolState::Play, _) => {
-            // TEMP chat-id probe: most chat-shaped packets are exactly one
-            // string, so surface those at info level while we identify which
-            // id 26.2 uses for unsigned player chat.
-            let mut probe = Reader::new(payload);
-            if let Ok(text) = probe.read_string() {
-                if probe.remaining() == 0 && !text.is_empty() && !text.starts_with('/') {
-                    info!(
-                        "probe: connection {} play packet 0x{id:02X} is a lone string {:?}",
-                        session.id, text
-                    );
-                }
-            }
+            // TEMP: surface every unrecognised play packet so we can see which
             debug!("connection {} play packet 0x{id:02X} tolerated", session.id);
         }
         _ => return Err(ProtoError::UnknownPacket(id)),
@@ -5232,6 +5232,53 @@ mod tests {
     }
 
     #[test]
+    fn returning_player_resumes_snapshot_on_login() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stack = test_stack();
+        stack
+            .1
+            .set_player_store(crate::persist::PlayerStore::new(tmp.path().join("players")));
+        let mut inventory = vec![(0, 0); 9];
+        inventory.push((28, 5)); // slot 9: 5 dirt
+        crate::persist::PlayerStore::new(tmp.path().join("players"))
+            .save_player(&crate::persist::PlayerData {
+                name: "Returner".to_owned(),
+                world: "world".to_owned(),
+                x: 10.5,
+                y: 66.0,
+                z: -3.5,
+                yaw: 90.0,
+                pitch: 0.0,
+                gamemode: "creative".to_owned(),
+                flying: false,
+                selected: 1,
+                inventory,
+                cursor: (1, 2),
+            })
+            .unwrap();
+
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "Returner");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        let player = stack.1.players.get(1).unwrap();
+        assert_eq!((player.x, player.y, player.z), (10.5, 66.0, -3.5));
+        assert_eq!(player.gamemode, GameMode::Creative);
+        assert_eq!(player.inventory.selected(), 1);
+        assert_eq!(
+            player.inventory.get(9).unwrap(),
+            crate::inventory::ItemStack::new(crate::inventory::Item::Dirt, 5).unwrap()
+        );
+        assert_eq!(
+            player.cursor,
+            crate::inventory::ItemStack::new(crate::inventory::Item::Stone, 2).unwrap()
+        );
+    }
+
+    #[test]
     fn malformed_login_start_disconnects() {
         let mut stack = test_stack();
         let addr = stack.2;
@@ -5620,9 +5667,17 @@ mod tests {
     }
 
     fn send_message(client: &mut ScriptClient, message: &str) {
+        // Signed Chat Message (0x09) with no signature, matching what an
+        // offline-mode client sends.
         let mut body = Writer::new();
         body.write_string(message);
-        client.send_packet(PLAY_CHAT_MESSAGE, &body.into_bytes());
+        body.write_i64(0); // timestamp
+        body.write_i64(0); // salt
+        body.write_bool(false); // no signature
+        body.write_varint(0); // offset
+        body.write_bytes(&[0, 0, 0]); // acknowledged bitset
+        body.write_u8(0); // checksum
+        client.send_packet(0x09, &body.into_bytes());
     }
 
     /// Scans a few inbound packets for one system chat carrying `needle`,

@@ -177,8 +177,7 @@ impl PlayerStore {
 
     pub fn save_player(&self, data: &PlayerData) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        let text = toml::to_string_pretty(data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let text = toml::to_string_pretty(data).map_err(std::io::Error::other)?;
         std::fs::write(self.player_file(&data.name), text)?;
         Ok(())
     }
