@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn strings_roundtrip() {
-        for text in ["", "hello", "A FeatherMC Server", "Grüße 🎮 こんにちは"] {
+        for text in ["", "hello", "A SpironMC Server", "Grüße 🎮 こんにちは"] {
             let mut writer = Writer::new();
             writer.write_string(text);
             let bytes = writer.into_bytes();

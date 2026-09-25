@@ -1,4 +1,4 @@
-pub const NAME: &str = env!("CARGO_PKG_NAME");
+pub const NAME: &str = "SpironMC";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[must_use]

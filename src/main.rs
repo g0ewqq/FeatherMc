@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use tracing::error;
 
-use feathermc::{Config, RuntimeDirs, Server};
+use spironmc::{Config, RuntimeDirs, Server};
 
 fn main() -> ExitCode {
     match run() {
@@ -14,9 +14,9 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> feathermc::Result<()> {
-    if let Err(err) = feathermc::logging::init() {
-        if !matches!(err, feathermc::Error::LoggingAlreadyInitialized) {
+fn run() -> spironmc::Result<()> {
+    if let Err(err) = spironmc::logging::init() {
+        if !matches!(err, spironmc::Error::LoggingAlreadyInitialized) {
             return Err(err);
         }
     }

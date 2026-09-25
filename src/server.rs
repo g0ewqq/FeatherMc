@@ -7,12 +7,15 @@ use crate::console::{self, ConsoleCommand, Event};
 use crate::error::{Error, Result};
 use crate::java::{JavaHandler, ServerStatus};
 use crate::{
-    Clock, Config, NetworkManager, RuntimeDirs, Scheduler, SharedState, State, WorldManager,
+    persist::PlayerStore, Clock, Config, NetworkManager, RuntimeDirs, Scheduler, SharedState,
+    State, WorldManager,
 };
 
 const STATUS_INTERVAL_TICKS: u64 = 200;
 /// Extra sockets beyond max_players for status pings and logins in flight.
 const CONNECTION_HEADROOM: usize = 32;
+/// Autosave every 5 minutes at 20 TPS.
+const AUTOSAVE_INTERVAL_TICKS: u64 = 6000;
 
 pub struct Server {
     config: Config,
@@ -69,6 +72,15 @@ impl Server {
         &mut self.worlds
     }
 
+    /// Flushes dirty chunks and player snapshots to disk.
+    fn autosave(&mut self) {
+        let chunks = self.worlds.save_all();
+        let players = self.java.save_players();
+        if chunks > 0 || players > 0 {
+            info!("Saved {chunks} chunk(s) and {players} player(s)");
+        }
+    }
+
     pub fn run(self) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         install_shutdown_handler(&tx)?;
@@ -97,6 +109,14 @@ impl Server {
         ));
         info!("Listening on {addr}");
 
+        // Attach on-disk storage so worlds and player snapshots survive a
+        // restart. Without this everything stays memory-only and every
+        // launch regenerates the world from scratch.
+        self.worlds.attach_store(&self.dirs.worlds);
+        self.java
+            .set_player_store(PlayerStore::new(self.dirs.players.clone()));
+        info!("Storage enabled under {:?}", self.dirs.base);
+
         self.scheduler.run_every(STATUS_INTERVAL_TICKS, |tick| {
             info!("Server tick {tick}");
         });
@@ -121,6 +141,9 @@ impl Server {
                 .pump_blocks(&mut self.network, &mut self.worlds, tick);
             self.java.pump_drops(&mut self.network, &mut self.worlds);
             self.java.pump_inventory(&mut self.network);
+            if tick % AUTOSAVE_INTERVAL_TICKS == 0 && tick > 0 {
+                self.autosave();
+            }
             self.clock.record(started.elapsed());
 
             match events.recv_timeout(self.clock.target().saturating_sub(started.elapsed())) {
@@ -149,6 +172,8 @@ impl Server {
         state = State::Stopping;
         self.state.set(state);
         info!(?state, "Stopping {}", crate::version::NAME);
+        // Flush before the sockets close so a clean stop never loses work.
+        self.autosave();
         self.network.shutdown();
 
         state = State::Stopped;

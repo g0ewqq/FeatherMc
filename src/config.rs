@@ -28,8 +28,8 @@ fn default_max_players() -> u32 {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            name: "FeatherMC".to_owned(),
-            motd: "A FeatherMC Server".to_owned(),
+            name: "SpironMC".to_owned(),
+            motd: "A SpironMC Server".to_owned(),
             max_players: default_max_players(),
         }
     }

@@ -1,5 +1,5 @@
 <p align="center">
-	<b><font size="+3">FeatherMC</font></b><br>
+	<b><font size="+3">SpironMC</font></b><br>
 	<b>A from-scratch Minecraft: Java Edition server written in Rust</b>
 </p>
 
@@ -11,23 +11,23 @@
 
 ## What is this?
 
-FeatherMC is a Minecraft: Java Edition server built from scratch in Rust,
+SpironMC is a Minecraft: Java Edition server built from scratch in Rust,
 with no vanilla server code. Every packet on the wire is implemented by
 hand against the real protocol and verified with real Java clients.
 
 If you want to tinker with server internals, learn the Minecraft protocol,
 or grow a small multiplayer sandbox, this is for you.
 
-- 🧱 **Real gameplay foundation** - join, spawn, walk, fall, break and place
+- **Real gameplay foundation** - join, spawn, walk, fall, break and place
   blocks, see other players move, sneak and look around
-- 🗺️ **Server-side world** - deterministic flat overworld with chunk storage,
+- **Server-side world** - deterministic flat overworld with chunk storage,
   serialization and streaming straight from memory
-- ⚡ **20 TPS tick loop** - network, physics, chunk streaming and entity
+- **20 TPS tick loop** - network, physics, chunk streaming and entity
   tracking run on a fixed-rate schedule
-- 🔍 **Protocol-first development** - every packet ID and layout is verified
-  against authoritative sources, never guessed
+- **Hand-written protocol** - packets are encoded and decoded by hand against
+  the protocol rather than generated
 
-## FeatherMC is NOT a vanilla Minecraft server.
+## SpironMC is NOT a vanilla Minecraft server.
 
 It is poorly suited to hosting a survival server. It is missing most of the
 vanilla game, such as world generation, mobs and AI, redstone, fluids,
@@ -35,7 +35,7 @@ inventory, combat, persistence and plugins.
 
 If you just want to play **vanilla survival multiplayer**, use the
 [official Minecraft: Java server software](https://www.minecraft.net/en-us/download/server)
-(or Paper/Purpur) instead of FeatherMC.
+(or Paper/Purpur) instead of SpironMC.
 
 ## Supported Versions
 
@@ -89,8 +89,8 @@ running because Windows locks the executable; stop it first.)
 
 ```toml
 [server]
-name = "FeatherMC"
-motd = "A FeatherMC Server"
+name = "SpironMC"
+motd = "A SpironMC Server"
 max_players = 20
 
 [network]
@@ -117,17 +117,23 @@ java_port = 25565
   `/gamemode <mode> [player]`, abilities sync with client-toggled
   flight (gravity-exempt), instant digging, placement without
   consuming items, and creative slot writes with slot -1 drops
+- Player chat: inbound messages are sanitized and length-capped, then
+  broadcast to every player in play
+- Disk persistence: chunks are stored as run-length encoded files and player
+  snapshots as TOML, flushed on an autosave interval and again on shutdown
 - Full NBT reader/writer, TOML config, structured logging
 
 ## Known limitations
 
-Single flat world, no disk persistence, placing uses the held hotbar
+Single flat world with a single plains biome, placing uses the held hotbar
 item and only Stone, Dirt and Grass Block exist server-side (other
 items fall back to the held survival item and the client is corrected,
 which looks like morphing), creative inventory is client-trusted (any
 stack size up to the max and any known item can be written to any
 slot), full-bright lighting, default skins, no mobs, combat, redstone,
-fluids or plugins.
+fluids or plugins. The server runs in offline mode with no encryption or
+compression, chat is broadcast as unsigned system messages, and the
+inbound chat packet ID has not yet been confirmed against a real client.
 
 ## Project layout
 
@@ -137,6 +143,7 @@ src/
   lib.rs         library root
   server.rs      tick loop and lifecycle
   world.rs       worlds, chunks, sections, blocks
+  persist.rs     chunk and player snapshot storage
   entity.rs      minimal entity foundation
   network/       listener, connections, framing
   java/          protocol: packets, registries, NBT, session,
@@ -147,7 +154,7 @@ src/
 
 ## Contributing
 
-FeatherMC is an early-stage learning project. Bug reports with client
+SpironMC is an early-stage learning project. Bug reports with client
 disconnect logs (`debug/disconnect-*.txt` plus the exact behavior) are the
 most useful contribution right now.
 
@@ -155,6 +162,6 @@ most useful contribution right now.
 
 No license has been chosen yet. All rights reserved for now.
 
-FeatherMC is not affiliated with Mojang or Microsoft. All brands and
+SpironMC is not affiliated with Mojang or Microsoft. All brands and
 trademarks belong to their respective owners. It is not Mojang-approved
 software.

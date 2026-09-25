@@ -287,11 +287,11 @@ fn read_hashed_slot(reader: &mut Reader) -> Result<(), ProtoError> {
     Ok(())
 }
 
-/// Slot reader for Set Creative Mode Slot, mirroring `write_slot`: a count
-/// varint first (0 = empty, no boolean prefix), then item ID plus added /
-/// removed component counts. Only componentless stacks are accepted, matching
-/// `decode_slot` — component payloads cannot be skipped without a data
-/// component registry, and plain vanilla items carry none.
+/// Slot reader for Set Creative Mode Slot, mirroring `write_slot`: count varint
+/// first (0 = empty, no boolean prefix), then item id plus added/removed
+/// component counts. Only componentless stacks get through, same as
+/// `decode_slot` — you can't skip a component payload without a data component
+/// registry, and plain vanilla items carry none anyway.
 fn read_slot(reader: &mut Reader) -> Option<Option<ItemStack>> {
     let count = reader.read_varint().ok()?;
     if !(0..=crate::inventory::MAX_STACK as i32).contains(&count) {
@@ -373,6 +373,7 @@ pub struct JavaHandler {
     players: PlayerRegistry,
     entity_id_counter: i32,
     departed: Vec<u128>,
+    player_store: Option<crate::persist::PlayerStore>,
 }
 
 impl JavaHandler {
@@ -384,7 +385,29 @@ impl JavaHandler {
             players: PlayerRegistry::new(),
             entity_id_counter: 1,
             departed: Vec::new(),
+            player_store: None,
         }
+    }
+
+    /// Wire up player snapshot storage. No store (tests) means every login
+    /// just starts fresh at spawn.
+    pub fn set_player_store(&mut self, store: crate::persist::PlayerStore) {
+        self.player_store = Some(store);
+    }
+
+    /// Snapshot everyone connected; returns how many we actually wrote.
+    pub fn save_players(&self) -> usize {
+        let Some(store) = self.player_store.as_ref() else {
+            return 0;
+        };
+        let mut saved = 0;
+        for player in self.players.iter() {
+            match store.save_player(&player.persist()) {
+                Ok(()) => saved += 1,
+                Err(e) => debug!("failed to save player {}: {e}", player.name),
+            }
+        }
+        saved
     }
 
     #[must_use]
@@ -475,6 +498,9 @@ impl JavaHandler {
                 Some(PacketAction::ChatCommand(command)) => {
                     self.run_chat_command(id, network, &command);
                 }
+                Some(PacketAction::ChatMessage(message)) => {
+                    self.handle_chat_message(network, id, &message);
+                }
                 Some(PacketAction::CreativeSlot { slot, item }) => {
                     // Creative inventory writes are only honored for
                     // creative players; others silently ignore them.
@@ -541,9 +567,9 @@ impl JavaHandler {
                 return;
             }
         }
-        // Drop play sessions whose client stopped answering keepalives so
-        // dead connections cannot linger (and inflate player counts) until
-        // an OS-level timeout.
+        // Drop play sessions that stopped answering keepalives, so dead
+        // connections don't linger (and inflate the player count) until the OS
+        // times them out.
         let keepalive_timed_out = matches!(
             self.sessions.get(&id),
             Some(session)
@@ -640,8 +666,8 @@ impl JavaHandler {
             }
             self.sessions.remove(&old_id);
         }
-        // Vanilla behavior: a full server turns newcomers away instead of
-        // degrading for everyone. Duplicates above already freed their slot.
+        // Vanilla turns newcomers away when full rather than degrading for
+        // everyone. Duplicate logins above have already freed their slot.
         if self.players.len() >= self.status.max_players as usize {
             debug!("connection {id} rejected: server full");
             if let Some(conn) = network.connection_mut(id) {
@@ -665,7 +691,17 @@ impl JavaHandler {
             conn.close();
             return;
         };
-        let player = PlayerSession::new(id, name.clone(), uuid, version, entity_id, session_id);
+        let mut player = PlayerSession::new(id, name.clone(), uuid, version, entity_id, session_id);
+        // Returning players resume where they left off; missing or
+        // corrupt snapshots fall back to a fresh spawn.
+        if let Some(data) = self
+            .player_store
+            .as_ref()
+            .and_then(|store| store.load_player(&name))
+        {
+            player.apply_persisted(&data);
+            debug!("restored snapshot for player {name}");
+        }
         let response = encode_login_success(uuid.unwrap_or_default(), &player.name, session_id);
         let Some(conn) = network.connection_mut(id) else {
             return;
@@ -693,10 +729,9 @@ impl JavaHandler {
         info!("Player login completed: {name}");
     }
 
-    /// Chunks streamed per tick per player. A full radius batch is 169
-    /// chunks (~10MB, ~1s of encoding on this hardware); trickling keeps
-    /// ticks near budget and lets the client render progressively instead
-    /// of stalling on one giant burst.
+    /// Chunks per tick, per player. A whole radius in one go is 169 chunks
+    /// (~10MB, ~1s of encoding on this box) — trickling keeps ticks near budget
+    /// and lets the client render progressively instead of stalling on one burst.
     pub fn pump_chunks(&mut self, network: &mut NetworkManager, worlds: &mut WorldManager) {
         let ids: Vec<ConnectionId> = self
             .sessions
@@ -856,8 +891,8 @@ impl JavaHandler {
         };
         let before = (player.x, player.y, player.z);
         let mut correct = false;
-        // Only spectators noclip. Creative flight still collides with
-        // blocks (vanilla behavior); both skip gravity below.
+        // Only spectators noclip — creative flight still collides with blocks,
+        // same as vanilla. Both skip gravity further down.
         if player.gamemode != GameMode::Spectator && collides(world, player.x, player.y, player.z) {
             player.x = session.sim_x;
             player.z = session.sim_z;
@@ -1901,6 +1936,40 @@ impl JavaHandler {
         }
     }
 
+    /// One inbound message: clean it, log it, echo it to everyone in play.
+    /// Anything empty after cleaning is dropped, so whitespace spam goes nowhere.
+    fn handle_chat_message(
+        &mut self,
+        network: &mut NetworkManager,
+        id: ConnectionId,
+        message: &str,
+    ) {
+        let message = sanitize_chat(message, MAX_CHAT_LEN);
+        if message.is_empty() {
+            return;
+        }
+        let Some(name) = self.players.get(id).map(|player| player.name.clone()) else {
+            return;
+        };
+        info!("<{name}> {message}");
+        self.broadcast_chat(network, &format!("<{name}> {message}"));
+    }
+
+    /// Fans one message out to every connection that reached play.
+    fn broadcast_chat(&mut self, network: &mut NetworkManager, text: &str) {
+        let viewers: Vec<ConnectionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.state == ProtocolState::Play)
+            .map(|(id, _)| *id)
+            .collect();
+        for viewer in viewers {
+            if let Some(conn) = network.connection_mut(viewer) {
+                send_response(conn, &encode_system_chat(text));
+            }
+        }
+    }
+
     fn run_chat_command(&mut self, id: ConnectionId, network: &mut NetworkManager, command: &str) {
         let mut words = command.split_whitespace();
         match words.next() {
@@ -1959,6 +2028,38 @@ impl JavaHandler {
                     self.send_chat(network, id, "That player already has that game mode");
                 }
             }
+            Some(word) if word.eq_ignore_ascii_case("list") => {
+                let mut names: Vec<String> = Vec::new();
+                for (pid, session) in self.sessions.iter() {
+                    if session.state != ProtocolState::Play {
+                        continue;
+                    }
+                    if let Some(player) = self.players.get(*pid) {
+                        names.push(player.name.clone());
+                    }
+                }
+                if names.is_empty() {
+                    self.send_chat(network, id, "No players online");
+                } else {
+                    let count = names.len();
+                    self.send_chat(
+                        network,
+                        id,
+                        &format!("{count} online: {}", names.join(", ")),
+                    );
+                }
+            }
+            Some(word) if word.eq_ignore_ascii_case("save") => {
+                let saved = self.save_players();
+                self.send_chat(network, id, &format!("Saved {saved} player snapshot(s)"));
+            }
+            Some(word) if word.eq_ignore_ascii_case("help") => {
+                self.send_chat(
+                    network,
+                    id,
+                    "Commands: /gamemode <mode> [player], /list, /save, /help",
+                );
+            }
             _ => {
                 self.send_chat(network, id, "Unknown or incomplete command");
             }
@@ -1999,6 +2100,7 @@ enum PacketAction {
     Edit(PendingEdit),
     KeyDrop(KeyDrop),
     ChatCommand(String),
+    ChatMessage(String),
     KeepAliveAck(i64),
     SelectSlot(u8),
     HeldEcho,
@@ -2019,6 +2121,16 @@ enum PacketAction {
     },
 }
 
+/// Strips control characters and caps length on untrusted chat input.
+fn sanitize_chat(text: &str, max_len: usize) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(max_len)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 fn finite_or_keep_angle(value: f32, fallback: f32) -> f32 {
     if value.is_finite() {
         value.clamp(-180.0, 180.0)
@@ -2026,6 +2138,13 @@ fn finite_or_keep_angle(value: f32, fallback: f32) -> f32 {
         fallback
     }
 }
+
+/// Serverbound id for unsigned player chat (protocol 776). Derived from the
+/// 1.20.x table shifted by +3, which is the offset `/help` confirms for
+/// Chat Command (0x04 -> 0x07). Remove the probe below once verified.
+const PLAY_CHAT_MESSAGE: i32 = 0x08;
+/// Chat is untrusted input, so cap it before it goes anywhere.
+const MAX_CHAT_LEN: usize = 256;
 
 fn handle_packet(
     status: &ServerStatus,
@@ -2197,6 +2316,20 @@ fn handle_packet(
                 session.id
             );
         }
+        (ProtocolState::Play, PLAY_CHAT_MESSAGE) => {
+            // Unsigned player chat: a bare message string, same shape as a
+            // chat command but without the leading slash.
+            let mut reader = Reader::new(payload);
+            if let Ok(message) = reader.read_string() {
+                if reader.remaining() == 0 {
+                    return Ok(PacketAction::ChatMessage(message));
+                }
+            }
+            debug!(
+                "connection {} chat message with unexpected shape tolerated",
+                session.id
+            );
+        }
         (ProtocolState::Play, 0x38) => {
             // Set Creative Mode Slot: slot -1 with an item drops it into the
             // world, slot -1 without an item clears the cursor. Only honored
@@ -2353,11 +2486,23 @@ fn handle_packet(
                 session.id
             );
         }
-        // Unknown IDs are tolerated (debug-logged) so a vanilla client
-        // sending newer/optional packets doesn't get disconnected.
-        // Reaching play means config already succeeded — dropping here
-        // shows up client-side as Connection reset.
+        // Tolerate unknown ids (debug-logged) so a vanilla client sending newer
+        // or optional packets doesn't get kicked. Config already succeeded by
+        // this point, so dropping the connection just shows up client-side as
+        // "Connection reset".
         (ProtocolState::Play, _) => {
+            // TEMP chat-id probe: most chat-shaped packets are exactly one
+            // string, so surface those at info level while we identify which
+            // id 26.2 uses for unsigned player chat.
+            let mut probe = Reader::new(payload);
+            if let Ok(text) = probe.read_string() {
+                if probe.remaining() == 0 && !text.is_empty() && !text.starts_with('/') {
+                    info!(
+                        "probe: connection {} play packet 0x{id:02X} is a lone string {:?}",
+                        session.id, text
+                    );
+                }
+            }
             debug!("connection {} play packet 0x{id:02X} tolerated", session.id);
         }
         _ => return Err(ProtoError::UnknownPacket(id)),
@@ -5472,6 +5617,76 @@ mod tests {
             crate::java::nbt::NbtTag::String(text) => text,
             _ => panic!("system chat content must be plain text"),
         }
+    }
+
+    fn send_message(client: &mut ScriptClient, message: &str) {
+        let mut body = Writer::new();
+        body.write_string(message);
+        client.send_packet(PLAY_CHAT_MESSAGE, &body.into_bytes());
+    }
+
+    /// Scans a few inbound packets for one system chat carrying `needle`,
+    /// so unrelated packets queued by joining cannot break the assertion.
+    fn finds_system_chat(client: &mut ScriptClient, needle: &str) -> bool {
+        for _ in 0..10 {
+            let (id, payload) = client.read_packet();
+            if id != 0x79 {
+                continue;
+            }
+            let mut reader = Reader::new(&payload);
+            let Ok(tag) = crate::java::nbt::NbtTag::decode_unnamed(&mut reader) else {
+                continue;
+            };
+            if let crate::java::nbt::NbtTag::String(text) = tag {
+                if text.contains(needle) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn chat_message_reaches_the_other_player() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut alice = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut alice, "Alice");
+        for _ in 0..3 {
+            alice.read_packet();
+        }
+        let mut bob = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 2);
+        join_play_uuid(
+            &mut stack,
+            &mut bob,
+            "Bob",
+            0x223E_4567_E89B_12D3_A456_4266_1417_4001,
+        );
+        settle(&mut stack);
+
+        send_message(&mut alice, "hello world");
+        pump(&mut stack);
+        settle(&mut stack);
+
+        assert!(finds_system_chat(&mut bob, "<Alice> hello world"));
+    }
+
+    #[test]
+    fn chat_message_strips_control_characters() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut alice = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut alice, "Alice");
+        settle(&mut stack);
+
+        send_message(&mut alice, "hi\u{07}there");
+        pump(&mut stack);
+        settle(&mut stack);
+
+        assert!(finds_system_chat(&mut alice, "<Alice> hithere"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub struct RuntimeDirs {
     pub config: PathBuf,
     pub logs: PathBuf,
     pub worlds: PathBuf,
+    pub players: PathBuf,
     pub plugins: PathBuf,
 }
 
@@ -19,12 +20,19 @@ impl RuntimeDirs {
             config: base.join("config"),
             logs: base.join("logs"),
             worlds: base.join("worlds"),
+            players: base.join("players"),
             plugins: base.join("plugins"),
         }
     }
 
     pub fn ensure_all(&self) -> Result<()> {
-        for dir in [&self.config, &self.logs, &self.worlds, &self.plugins] {
+        for dir in [
+            &self.config,
+            &self.logs,
+            &self.worlds,
+            &self.players,
+            &self.plugins,
+        ] {
             std::fs::create_dir_all(dir)?;
         }
         Ok(())

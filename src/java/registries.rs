@@ -5,9 +5,9 @@ use super::proto::Writer;
 
 pub struct RegistryEntry {
     pub id: &'static str,
-    /// Entry NBT. `None` omits NBT (`has_data = false`) so the client
-    /// loads vanilla data from its selected known packs (`minecraft:core`).
-    /// This avoids having to craft exact NBT for every vanilla entry.
+    /// Entry NBT. `None` omits it (`has_data = false`) so the client loads
+    /// vanilla data from its own known packs (`minecraft:core`) — saves having
+    /// to hand-craft exact NBT for every vanilla entry.
     pub data: Option<NbtTag>,
 }
 
@@ -34,13 +34,13 @@ impl ProtocolRegistry {
     }
 }
 
-/// Minimal overworld dimension NBT that avoids all tag lookups.
+/// Minimal overworld dimension NBT that dodges every tag lookup.
 ///
-/// The vanilla overworld references `#minecraft:infiniburn_overworld`,
-/// `#minecraft:in_overworld` timelines and `minecraft:overworld` world
-/// clock, which all require extra tag/registry data the server doesn't
-/// send. 26.2 accepts a plain block ID for `infiniburn`, and `timelines`
-/// / `default_clock` are optional, so we omit them entirely.
+/// Vanilla's overworld points at `#minecraft:infiniburn_overworld`, the
+/// `#minecraft:in_overworld` timelines and the `minecraft:overworld` clock —
+/// all of which need tag/registry data this server never sends. 26.2 takes a
+/// plain block id for `infiniburn`, and `timelines`/`default_clock` are
+/// optional, so we leave them out entirely.
 fn minimal_overworld_dimension() -> NbtTag {
     NbtTag::compound(vec![
         ("ambient_light".to_owned(), NbtTag::Float(0.0)),

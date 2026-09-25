@@ -47,8 +47,8 @@ pub fn encode_player_info_remove(uuids: &[u128]) -> Vec<u8> {
     encode_packet(0x45, &body.into_bytes())
 }
 
-/// Zero-velocity LpVec3. Per the 26.2 data types page, (0,0,0) encodes as
-/// a single 0x00 byte (not three shorts/varints like older formats).
+/// Zero-velocity LpVec3. Per the 26.2 data types page (0,0,0) encodes as a
+/// single 0x00 byte — not three shorts/varints the way older formats did.
 fn write_stationary_velocity(body: &mut Writer) {
     body.write_u8(0);
 }

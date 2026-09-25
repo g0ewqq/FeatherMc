@@ -53,7 +53,7 @@ pub fn parse(input: &str) -> Option<ConsoleCommand> {
 pub fn spawn(sender: &Sender<Event>) -> io::Result<JoinHandle<()>> {
     let sender = sender.clone();
     thread::Builder::new()
-        .name("feathermc-console".into())
+        .name("spironmc-console".into())
         .spawn(move || {
             for line in io::stdin().lock().lines() {
                 let line = match line {

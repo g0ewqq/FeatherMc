@@ -37,9 +37,9 @@ impl NetworkManager {
         }
     }
 
-    /// Bounds total accepted connections so idle sockets cannot grow memory
-    /// without limit. When reached, new sockets stay in the OS backlog until
-    /// a slot frees up. `None` (the default) accepts without bound.
+    /// Cap on accepted connections so idle sockets can't grow memory forever.
+    /// At the limit, new sockets sit in the OS backlog until a slot frees up.
+    /// `None` (the default) means no cap at all.
     pub fn set_max_connections(&mut self, max: Option<usize>) {
         self.max_connections = max;
     }
@@ -261,8 +261,8 @@ mod tests {
         let mut client = connect(addr);
         wait_until(&mut manager, |m| m.connection_count() == 1);
 
-        client.write_all(&frame(b"hello-feather")).unwrap();
-        assert_eq!(recv_packet(&mut manager, 1), b"hello-feather");
+        client.write_all(&frame(b"hello-spiron")).unwrap();
+        assert_eq!(recv_packet(&mut manager, 1), b"hello-spiron");
         assert!(manager.metrics().bytes_read >= 15);
     }
 

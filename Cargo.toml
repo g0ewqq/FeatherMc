@@ -1,17 +1,17 @@
 [package]
-name = "feathermc"
+name = "spironmc"
 version = "0.1.0"
 edition = "2021"
-description = "FeatherMC — a from-scratch Minecraft server written in Rust"
+description = "SpironMC — a from-scratch Minecraft server written in Rust"
 readme = "README.md"
 rust-version = "1.74"
 
 [[bin]]
-name = "feathermc"
+name = "spironmc"
 path = "src/main.rs"
 
 [lib]
-name = "feathermc"
+name = "spironmc"
 path = "src/lib.rs"
 
 [dependencies]

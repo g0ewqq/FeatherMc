@@ -8,6 +8,7 @@ pub mod inventory;
 pub mod java;
 pub mod logging;
 pub mod network;
+pub mod persist;
 pub mod scheduler;
 pub mod server;
 pub mod state;

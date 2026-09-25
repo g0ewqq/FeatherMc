@@ -198,8 +198,8 @@ pub const ABILITY_FLYING: u8 = 0x02;
 pub const ABILITY_ALLOW_FLYING: u8 = 0x04;
 pub const ABILITY_INSTANT_BUILD: u8 = 0x08;
 
-/// Tells the client which abilities are active. Sent on play entry for
-/// creative players and whenever the flying state changes.
+/// Sent on play entry for creative players and whenever flight flips; tells
+/// the client which abilities are live.
 pub fn encode_player_abilities(flags: u8) -> Vec<u8> {
     let mut body = Writer::new();
     body.write_u8(flags);
@@ -294,9 +294,9 @@ pub fn encode_known_packs() -> Vec<u8> {
 
 /// Item tags the client needs to resolve vanilla sulfur archetype NBT.
 ///
-/// Each `sulfur_cube_archetype` entry's `items` field references one of
-/// these tags. They are sent with zero entries (empty) — the tag exists
-/// so the lookup succeeds; no numeric item IDs are needed.
+/// Every `sulfur_cube_archetype` entry's `items` field points at one of these.
+/// We send them empty — the tag only has to exist for the lookup to succeed,
+/// no numeric item ids required.
 pub const SULFUR_ITEM_TAGS: [&str; 14] = [
     "minecraft:sulfur_cube_archetype/regular",
     "minecraft:sulfur_cube_archetype/bouncy",
@@ -435,10 +435,10 @@ mod tests {
 
     #[test]
     fn status_json_has_vanilla_shape() {
-        let json = status_json("26.2", 776, "A FeatherMC Server", 20);
+        let json = status_json("26.2", 776, "A SpironMC Server", 20);
         assert_eq!(
             json,
-            "{\"version\":{\"name\":\"26.2\",\"protocol\":776},\"players\":{\"max\":20,\"online\":0},\"description\":{\"text\":\"A FeatherMC Server\"}}"
+            "{\"version\":{\"name\":\"26.2\",\"protocol\":776},\"players\":{\"max\":20,\"online\":0},\"description\":{\"text\":\"A SpironMC Server\"}}"
         );
     }
 

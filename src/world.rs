@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::entity::Entity;
 use crate::inventory::ItemStack;
+use crate::persist::{decode_sections, encode_sections, WorldStore, SECTION_BLOCKS};
 
 pub const DEFAULT_WORLD_NAME: &str = "world";
 pub const DEFAULT_DIMENSION_ID: &str = "minecraft:overworld";
@@ -202,20 +204,62 @@ impl ChunkSection {
 pub struct Chunk {
     pos: ChunkPos,
     sections: Vec<ChunkSection>,
+    dirty: bool,
 }
 
 impl Chunk {
     #[must_use]
     pub fn new(x: i32, z: i32) -> Self {
-        let mut chunk = Self {
-            pos: ChunkPos::new(x, z),
-            sections: (0..SECTION_COUNT as i32).map(ChunkSection::new).collect(),
-        };
+        let mut chunk = Self::new_bare(x, z);
         chunk.generate_flat();
         for section in &mut chunk.sections {
             section.take_changed();
         }
         chunk
+    }
+
+    /// Sections without terrain: decode target and unit-test helper.
+    /// Starts clean, like freshly generated terrain.
+    #[must_use]
+    pub fn new_bare(x: i32, z: i32) -> Self {
+        Self {
+            pos: ChunkPos::new(x, z),
+            sections: (0..SECTION_COUNT as i32).map(ChunkSection::new).collect(),
+            dirty: false,
+        }
+    }
+
+    /// True since the last save (or since an edit created it). Only dirty
+    /// chunks ever hit the disk.
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Serialized section states for [`WorldStore`].
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let sections: Vec<&[u16; SECTION_BLOCKS]> =
+            self.sections.iter().map(|s| s.states()).collect();
+        encode_sections(&sections)
+    }
+
+    /// Inverse of [`Chunk::encode`]; rejects corrupt input and wrong sizes.
+    /// Comes back dirty so a freshly restored chunk gets saved again.
+    #[must_use]
+    pub fn decode(x: i32, z: i32, bytes: &[u8]) -> Option<Self> {
+        let states = decode_sections(bytes, SECTION_COUNT)?;
+        let mut chunk = Self::new_bare(x, z);
+        for (section, filled) in chunk.sections.iter_mut().zip(states.iter()) {
+            section.blocks.copy_from_slice(filled);
+            section.take_changed();
+        }
+        chunk.dirty = true;
+        Some(chunk)
     }
 
     pub fn section_mut(&mut self, index: usize) -> Option<&mut ChunkSection> {
@@ -273,12 +317,16 @@ impl Chunk {
             return None;
         }
         let section = self.section_for_y(y)?;
-        Some(self.sections[section].set_local(
+        let prev = self.sections[section].set_local(
             x.rem_euclid(CHUNK_WIDTH) as u8,
             (y - WORLD_MIN_Y) as u8 % SECTION_SIZE as u8,
             z.rem_euclid(CHUNK_WIDTH) as u8,
             block,
-        ))
+        );
+        if prev != block {
+            self.dirty = true;
+        }
+        Some(prev)
     }
 
     #[must_use]
@@ -335,6 +383,10 @@ impl ChunkManager {
     pub fn loaded_positions(&self) -> Vec<ChunkPos> {
         self.chunks.keys().copied().collect()
     }
+
+    pub fn insert(&mut self, pos: ChunkPos, chunk: Chunk) {
+        self.chunks.insert(pos, chunk);
+    }
 }
 
 pub struct DroppedItem {
@@ -354,6 +406,7 @@ pub struct World {
     spawn: Spawn,
     chunks: ChunkManager,
     drops: Vec<DroppedItem>,
+    store: Option<WorldStore>,
 }
 
 impl World {
@@ -367,6 +420,16 @@ impl World {
             spawn: Spawn::default_spawn(),
             chunks: ChunkManager::new(),
             drops: Vec::new(),
+            store: None,
+        }
+    }
+
+    /// Attaches on-disk storage, creating the directory. Without a store
+    /// the world is memory-only (previous behavior, still used by tests).
+    pub fn set_store(&mut self, base: &Path) {
+        let dir = base.join(&self.name);
+        if std::fs::create_dir_all(&dir).is_ok() {
+            self.store = Some(WorldStore::new(dir));
         }
     }
 
@@ -435,7 +498,47 @@ impl World {
     }
 
     pub fn load_chunk(&mut self, pos: ChunkPos) -> &mut Chunk {
-        self.chunks.load(pos)
+        if self.chunks.is_loaded(pos) {
+            return self.chunks.load(pos);
+        }
+        // Memory miss: try disk before generating flat terrain. Corrupt
+        // files are ignored (fall back to generation, never crash).
+        let restored = self.store.as_ref().and_then(|store| {
+            let bytes = store.load_chunk(pos.x, pos.z)?;
+            Chunk::decode(pos.x, pos.z, &bytes)
+        });
+        match restored {
+            Some(chunk) => {
+                self.chunks.insert(pos, chunk);
+                self.chunks.load(pos)
+            }
+            None => self.chunks.load(pos),
+        }
+    }
+
+    /// Flushes dirty chunks to disk. Returns how many were written.
+    pub fn save(&mut self) -> usize {
+        let Some(store) = self.store.clone() else {
+            return 0;
+        };
+        let mut saved = 0;
+        for pos in self.chunks.loaded_positions() {
+            let dirty = self.chunks.get(pos).is_some_and(Chunk::is_dirty);
+            if !dirty {
+                continue;
+            }
+            let Some(chunk) = self.chunks.get(pos) else {
+                continue;
+            };
+            let bytes = chunk.encode();
+            if store.save_chunk(pos.x, pos.z, &bytes).is_ok() {
+                saved += 1;
+                if let Some(chunk) = self.chunks.get_mut(pos) {
+                    chunk.mark_clean();
+                }
+            }
+        }
+        saved
     }
 
     #[must_use]
@@ -574,11 +677,53 @@ impl WorldManager {
     pub fn iter_mut(&mut self) -> std::collections::hash_map::ValuesMut<'_, String, World> {
         self.worlds.values_mut()
     }
+
+    /// Attaches on-disk storage under `base` (one subdirectory per world).
+    /// Worlds without modified chunks write nothing.
+    pub fn attach_store(&mut self, base: &Path) {
+        for world in self.worlds.values_mut() {
+            world.set_store(base);
+        }
+    }
+
+    /// Saves every world. Returns the total chunks written.
+    pub fn save_all(&mut self) -> usize {
+        self.worlds.values_mut().map(World::save).sum()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_store_writes_dirty_chunks_to_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut manager = WorldManager::create_default();
+        manager.attach_store(tmp.path());
+
+        for world in manager.iter_mut() {
+            world.load_chunk(ChunkPos::from_world(0, 0));
+            world.set_block(0, 64, 0, Block::Stone);
+        }
+
+        let saved = manager.save_all();
+        assert!(saved > 0, "expected at least one chunk to be written");
+
+        let mut found_bin = false;
+        let mut pending = vec![tmp.path().to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("bin") {
+                    found_bin = true;
+                }
+            }
+        }
+        assert!(found_bin, "no chunk file appeared on disk");
+    }
 
     #[test]
     fn chunk_conversion_at_boundaries() {

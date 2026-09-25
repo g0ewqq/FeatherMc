@@ -146,6 +146,80 @@ impl PlayerSession {
         }
     }
 
+    /// Snapshot for [`crate::persist::PlayerStore`].
+    #[must_use]
+    pub fn persist(&self) -> crate::persist::PlayerData {
+        crate::persist::PlayerData {
+            name: self.name.clone(),
+            world: self.world.clone(),
+            x: self.x,
+            y: self.y,
+            z: self.z,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            gamemode: match self.gamemode {
+                GameMode::Survival => "survival".to_owned(),
+                GameMode::Creative => "creative".to_owned(),
+                GameMode::Adventure => "adventure".to_owned(),
+                GameMode::Spectator => "spectator".to_owned(),
+            },
+            flying: self.flying,
+            selected: self.inventory.selected(),
+            inventory: (0..crate::inventory::INVENTORY_SIZE)
+                .map(|index| {
+                    let stack = self.inventory.get(index).unwrap_or(ItemStack::empty());
+                    (stack.item.id(), stack.count)
+                })
+                .collect(),
+            cursor: (self.cursor.item.id(), self.cursor.count),
+        }
+    }
+
+    /// Restore from a [`crate::persist::PlayerStore`] snapshot. Every field is
+    /// validated — bad entries fall back to current values or empty stacks
+    /// rather than panicking or landing in an invalid state.
+    pub fn apply_persisted(&mut self, data: &crate::persist::PlayerData) {
+        if !data.world.is_empty() {
+            self.world = data.world.clone();
+        }
+        if data.x.is_finite() && data.z.is_finite() {
+            self.x = data.x.clamp(-30_000_000.0, 30_000_000.0);
+            self.z = data.z.clamp(-30_000_000.0, 30_000_000.0);
+        }
+        if data.y.is_finite() {
+            self.y = data.y.clamp(-64.0, 320.0);
+        }
+        if data.yaw.is_finite() {
+            self.yaw = data.yaw.clamp(-180.0, 180.0);
+        }
+        if data.pitch.is_finite() {
+            self.pitch = data.pitch.clamp(-90.0, 90.0);
+        }
+        self.gamemode = match data.gamemode.as_str() {
+            "creative" => GameMode::Creative,
+            "adventure" => GameMode::Adventure,
+            "spectator" => GameMode::Spectator,
+            _ => GameMode::Survival,
+        };
+        self.flying = data.flying && self.is_flying_exempt_mode();
+        self.inventory.select(data.selected);
+        for (index, (id, count)) in data
+            .inventory
+            .iter()
+            .take(crate::inventory::INVENTORY_SIZE)
+            .enumerate()
+        {
+            self.inventory
+                .set(index, crate::persist::PlayerData::stack_of(*id, *count));
+        }
+        self.cursor = crate::persist::PlayerData::stack_of(data.cursor.0, data.cursor.1);
+    }
+
+    #[must_use]
+    fn is_flying_exempt_mode(&self) -> bool {
+        matches!(self.gamemode, GameMode::Creative | GameMode::Spectator)
+    }
+
     #[must_use]
     pub fn as_entity(&self) -> Entity {
         Entity {
