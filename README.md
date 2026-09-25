@@ -117,6 +117,10 @@ java_port = 25565
   `/gamemode <mode> [player]`, abilities sync with client-toggled
   flight (gravity-exempt), instant digging, placement without
   consuming items, and creative slot writes with slot -1 drops
+- Survival basics: fall damage with spawn protection, void kills,
+  health sync with slow regen, death messages, respawn at spawn
+  (inventory kept), `/kill`, and in-game chat with `/list` `/save`
+  `/help`
 - Player chat: inbound messages are sanitized and length-capped, then
   broadcast to every player in play
 - Disk persistence: chunks are stored as run-length encoded files and player

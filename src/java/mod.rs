@@ -26,10 +26,11 @@ pub use metadata::{player_metadata, MetadataEntry, MetadataKind};
 pub use nbt::NbtTag;
 pub use packets::{
     encode_block_changed_ack, encode_block_update, encode_container_content, encode_container_slot,
-    encode_default_spawn, encode_finish_configuration, encode_game_event, encode_held_slot,
-    encode_keep_alive, encode_known_packs, encode_login_disconnect, encode_login_success,
-    encode_play_login, encode_player_abilities, encode_pong, encode_status_response,
-    encode_sync_position, encode_system_chat, encode_update_tags, Handshake, LoginStart,
+    encode_default_spawn, encode_finish_configuration, encode_game_event, encode_health,
+    encode_held_slot, encode_keep_alive, encode_known_packs, encode_login_disconnect,
+    encode_login_success, encode_play_login, encode_player_abilities, encode_pong, encode_respawn,
+    encode_status_response, encode_sync_position, encode_system_chat, encode_update_tags,
+    Handshake, LoginStart,
 };
 pub use player::{GameMode, PlayerSession};
 pub use proto::{Reader, Writer, MAX_STRING_BYTES};

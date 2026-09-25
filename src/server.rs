@@ -135,7 +135,8 @@ impl Server {
             // players crossing into newly entered chunks (avoids a tick of
             // falling through unloaded ground at chunk edges).
             self.java.pump_chunks(&mut self.network, &mut self.worlds);
-            self.java.tick_physics(&mut self.network, &self.worlds);
+            self.java
+                .tick_physics(&mut self.network, &self.worlds, tick);
             self.java.pump_visibility(&mut self.network);
             self.java
                 .pump_blocks(&mut self.network, &mut self.worlds, tick);

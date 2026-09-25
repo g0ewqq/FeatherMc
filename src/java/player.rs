@@ -18,6 +18,15 @@ pub enum GameMode {
     Spectator = 3,
 }
 
+/// Full health: 20 half-hearts.
+pub const MAX_HEALTH: f32 = 20.0;
+/// Falls of this height or less never hurt (vanilla grants 3 blocks).
+pub const SAFE_FALL_DISTANCE: f64 = 3.0;
+/// Ticks after taking damage before slow regeneration may start.
+pub const REGEN_DELAY_TICKS: u64 = 200;
+/// One half-heart per this many ticks once regeneration runs.
+pub const REGEN_PERIOD_TICKS: u64 = 80;
+
 #[derive(Debug, Clone)]
 pub struct PlayerSession {
     pub connection_id: ConnectionId,
@@ -41,6 +50,11 @@ pub struct PlayerSession {
     pub sneaking: bool,
     pub sprinting: bool,
     pub flying: bool,
+    pub health: f32,
+    pub dead: bool,
+    pub fall_start: Option<f64>,
+    pub grounded_once: bool,
+    pub last_damage_tick: u64,
     pub inventory: Inventory,
     pub cursor: ItemStack,
 }
@@ -77,6 +91,11 @@ impl PlayerSession {
             sneaking: false,
             sprinting: false,
             flying: false,
+            health: MAX_HEALTH,
+            dead: false,
+            fall_start: None,
+            grounded_once: false,
+            last_damage_tick: 0,
             inventory: Inventory::starting(),
             cursor: ItemStack::empty(),
         }
@@ -157,6 +176,7 @@ impl PlayerSession {
             z: self.z,
             yaw: self.yaw,
             pitch: self.pitch,
+            health: self.health,
             gamemode: match self.gamemode {
                 GameMode::Survival => "survival".to_owned(),
                 GameMode::Creative => "creative".to_owned(),
@@ -202,6 +222,14 @@ impl PlayerSession {
             _ => GameMode::Survival,
         };
         self.flying = data.flying && self.is_flying_exempt_mode();
+        // Death is never restored: relogging while dead respawns healthy.
+        self.health = data.health.clamp(0.0, MAX_HEALTH);
+        if self.health <= 0.0 {
+            self.health = MAX_HEALTH;
+        }
+        self.dead = false;
+        self.fall_start = None;
+        self.last_damage_tick = 0;
         self.inventory.select(data.selected);
         for (index, (id, count)) in data
             .inventory

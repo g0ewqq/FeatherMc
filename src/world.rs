@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::entity::Entity;
@@ -516,6 +516,39 @@ impl World {
         }
     }
 
+    /// Drops every loaded chunk outside `keep`, writing dirty ones first.
+    /// Without a store, dirty chunks are kept (evicting would lose edits).
+    /// Returns (evicted, saved).
+    pub fn evict_outside(&mut self, keep: &HashSet<ChunkPos>) -> (usize, usize) {
+        let outside: Vec<ChunkPos> = self
+            .chunks
+            .loaded_positions()
+            .into_iter()
+            .filter(|pos| !keep.contains(pos))
+            .collect();
+        let mut evicted = 0;
+        let mut saved = 0;
+        for pos in outside {
+            let dirty = self.chunks.get(pos).is_some_and(Chunk::is_dirty);
+            if dirty {
+                let Some(store) = self.store.clone() else {
+                    continue;
+                };
+                let Some(chunk) = self.chunks.get(pos) else {
+                    continue;
+                };
+                if store.save_chunk(pos.x, pos.z, &chunk.encode()).is_err() {
+                    continue;
+                }
+                saved += 1;
+            }
+            if self.chunks.unload(pos) {
+                evicted += 1;
+            }
+        }
+        (evicted, saved)
+    }
+
     /// Flushes dirty chunks to disk. Returns how many were written.
     pub fn save(&mut self) -> usize {
         let Some(store) = self.store.clone() else {
@@ -888,6 +921,46 @@ mod tests {
         assert!(Block::Stone.is_solid());
         assert!(Block::GrassBlock.is_solid());
         assert!(!Block::Air.is_solid());
+    }
+
+    #[test]
+    fn evict_outside_saves_dirty_and_drops_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut world = World::default_world();
+        world.set_store(tmp.path());
+        let a = ChunkPos::new(0, 0);
+        let b = ChunkPos::new(1, 0);
+        let c = ChunkPos::new(2, 0);
+        world.load_chunk(a);
+        world.load_chunk(b);
+        world.load_chunk(c);
+        world.set_block(0, 65, 0, Block::Stone).unwrap();
+
+        let mut keep = HashSet::new();
+        keep.insert(b);
+        let (evicted, saved) = world.evict_outside(&keep);
+        assert_eq!((evicted, saved), (2, 1));
+        assert!(world.is_chunk_loaded(b));
+        assert!(!world.is_chunk_loaded(a));
+        assert!(!world.is_chunk_loaded(c));
+
+        // The edit survives a full reload from disk.
+        let mut fresh = World::default_world();
+        fresh.set_store(tmp.path());
+        assert_eq!(fresh.get_block(0, 65, 0), None);
+        fresh.load_chunk(a);
+        assert_eq!(fresh.get_block(0, 65, 0), Some(Block::Stone));
+        assert_eq!(fresh.get_block(0, 64, 0), Some(Block::GrassBlock));
+    }
+
+    #[test]
+    fn evict_outside_keeps_dirty_chunks_without_a_store() {
+        let mut world = World::default_world();
+        world.load_chunk(ChunkPos::new(0, 0));
+        world.set_block(0, 65, 0, Block::Stone).unwrap();
+        let (evicted, saved) = world.evict_outside(&HashSet::new());
+        assert_eq!((evicted, saved), (0, 0));
+        assert_eq!(world.get_block(0, 65, 0), Some(Block::Stone));
     }
 
     #[test]

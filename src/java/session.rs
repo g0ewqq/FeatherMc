@@ -18,12 +18,15 @@ use super::metadata::{MetadataEntry, MetadataKind};
 use super::packets::{
     decode_handshake, decode_login_start, encode_block_changed_ack, encode_block_update,
     encode_container_content, encode_container_slot, encode_default_spawn,
-    encode_finish_configuration, encode_game_event, encode_held_slot, encode_keep_alive,
-    encode_known_packs, encode_login_disconnect, encode_login_success, encode_play_login,
-    encode_player_abilities, encode_pong, encode_status_response, encode_sync_position,
-    encode_system_chat, encode_update_tags, DUPLICATE_LOGIN_REASON,
+    encode_finish_configuration, encode_game_event, encode_health, encode_held_slot,
+    encode_keep_alive, encode_known_packs, encode_login_disconnect, encode_login_success,
+    encode_play_login, encode_player_abilities, encode_pong, encode_respawn,
+    encode_status_response, encode_sync_position, encode_system_chat, encode_update_tags,
+    DUPLICATE_LOGIN_REASON,
 };
-use super::player::{GameMode, PlayerSession};
+use super::player::{
+    GameMode, PlayerSession, MAX_HEALTH, REGEN_DELAY_TICKS, REGEN_PERIOD_TICKS, SAFE_FALL_DISTANCE,
+};
 use super::proto::{decode_varint_prefix, Reader};
 use super::registries::{default_registries, encode_registry_data};
 use super::registry::PlayerRegistry;
@@ -496,7 +499,10 @@ impl JavaHandler {
                     }
                 }
                 Some(PacketAction::ChatCommand(command)) => {
-                    self.run_chat_command(id, network, &command);
+                    self.run_chat_command(id, network, &command, tick);
+                }
+                Some(PacketAction::Respawn) => {
+                    self.do_respawn(id, network);
                 }
                 Some(PacketAction::ChatMessage(message)) => {
                     self.handle_chat_message(network, id, &message);
@@ -536,7 +542,11 @@ impl JavaHandler {
                     has_position,
                     has_rotation,
                 }) => {
+                    // The dead stay put until they respawn.
                     if let Some(player) = self.players.get_mut(id) {
+                        if player.dead {
+                            continue;
+                        }
                         if has_position && x.is_finite() && y.is_finite() && z.is_finite() {
                             let dx = x - player.x;
                             let dy = y - player.y;
@@ -739,8 +749,28 @@ impl JavaHandler {
             .filter(|(_, session)| session.state == ProtocolState::Play)
             .filter_map(|(id, _)| self.players.get(*id).map(|_| *id))
             .collect();
-        for id in ids {
-            self.pump_chunks_one(id, network, worlds);
+        for id in &ids {
+            self.pump_chunks_one(*id, network, worlds);
+        }
+        // Reclaim server memory: drop chunks outside every viewer's radius,
+        // writing dirty ones first (no store, no eviction — edits would die).
+        let mut keep = HashSet::new();
+        for id in &ids {
+            if let Some(player) = self.players.get(*id) {
+                keep.extend(desired_chunks(ChunkPos::from_world(
+                    player.x.floor() as i32,
+                    player.z.floor() as i32,
+                )));
+            }
+        }
+        for world in worlds.iter_mut() {
+            let (evicted, saved) = world.evict_outside(&keep);
+            if evicted > 0 {
+                debug!(
+                    "evicted {evicted} chunk(s) ({saved} saved) in {}",
+                    world.name()
+                );
+            }
         }
     }
 
@@ -754,12 +784,7 @@ impl JavaHandler {
             Some(player) => ChunkPos::from_world(player.x.floor() as i32, player.z.floor() as i32),
             None => return,
         };
-        let mut desired = HashSet::new();
-        for dx in -CHUNK_RADIUS..=CHUNK_RADIUS {
-            for dz in -CHUNK_RADIUS..=CHUNK_RADIUS {
-                desired.insert(ChunkPos::new(center.x + dx, center.z + dz));
-            }
-        }
+        let desired = desired_chunks(center);
         let first = self
             .sessions
             .get(&id)
@@ -834,7 +859,7 @@ impl JavaHandler {
         }
     }
 
-    pub fn tick_physics(&mut self, network: &mut NetworkManager, worlds: &WorldManager) {
+    pub fn tick_physics(&mut self, network: &mut NetworkManager, worlds: &WorldManager, tick: u64) {
         let ids: Vec<ConnectionId> = self
             .sessions
             .iter()
@@ -842,7 +867,8 @@ impl JavaHandler {
             .filter_map(|(id, _)| self.players.get(*id).map(|_| *id))
             .collect();
         for id in ids {
-            let corrected = self.simulate_player(id, worlds);
+            let corrected = self.simulate_player(id, worlds, network, tick);
+            self.tick_regen(network, id, tick);
             if !corrected {
                 continue;
             }
@@ -877,7 +903,13 @@ impl JavaHandler {
         }
     }
 
-    fn simulate_player(&mut self, id: ConnectionId, worlds: &WorldManager) -> bool {
+    fn simulate_player(
+        &mut self,
+        id: ConnectionId,
+        worlds: &WorldManager,
+        network: &mut NetworkManager,
+        tick: u64,
+    ) -> bool {
         let world_name = match self.players.get(id) {
             Some(player) => player.world.clone(),
             None => return false,
@@ -889,6 +921,10 @@ impl JavaHandler {
         else {
             return false;
         };
+        // The dead stay frozen until they respawn.
+        if player.dead {
+            return false;
+        }
         let before = (player.x, player.y, player.z);
         let mut correct = false;
         // Only spectators noclip — creative flight still collides with blocks,
@@ -904,12 +940,13 @@ impl JavaHandler {
         player.vz = player.z - session.sim_z;
         // Flying players (creative toggle, spectators) are exempt from
         // gravity; landing happens via the flying toggle, not a ground
-        // probe.
+        // probe. Flight also resets any pending fall.
         if player.is_flying_exempt() {
             session.sim_x = player.x;
             session.sim_z = player.z;
             player.vy = 0.0;
             player.on_ground = false;
+            player.fall_start = None;
             return correct;
         }
         match world.ground_top(player.x, player.z, player.y) {
@@ -941,7 +978,184 @@ impl JavaHandler {
         }
         session.sim_x = player.x;
         session.sim_z = player.z;
+        if player.on_ground {
+            if player.grounded_once {
+                if let Some(start) = player.fall_start.take() {
+                    let fall = start - player.y;
+                    if fall > SAFE_FALL_DISTANCE {
+                        let damage = (fall - SAFE_FALL_DISTANCE).floor() as f32;
+                        let name = player.name.clone();
+                        self.damage_player(
+                            network,
+                            id,
+                            damage,
+                            format!("{name} hit the ground too hard"),
+                            tick,
+                        );
+                        return correct;
+                    }
+                }
+            } else {
+                player.grounded_once = true;
+                player.fall_start = None;
+            }
+        } else if player.grounded_once {
+            // Track the pre-move height: gravity already pulled this tick's
+            // y down, which would shave nearly a block off the fall.
+            let peak = player
+                .fall_start
+                .map_or(before.1, |start| start.max(before.1));
+            player.fall_start = Some(peak);
+        }
+        // Fell past the world: no ground will ever catch up.
+        if player.y < crate::world::WORLD_MIN_Y as f64 - 8.0 && !player.dead {
+            let name = player.name.clone();
+            self.damage_player(
+                network,
+                id,
+                f32::INFINITY,
+                format!("{name} fell out of the world"),
+                tick,
+            );
+        }
         correct
+    }
+
+    fn sync_health(&mut self, network: &mut NetworkManager, id: ConnectionId) {
+        if let (Some(player), Some(conn)) = (self.players.get(id), network.connection_mut(id)) {
+            send_response(conn, &encode_health(player.health));
+        }
+    }
+
+    /// Applies damage from any source. Creative/spectator/dead players are
+    /// immune. Killing blows show the death screen and announce the death.
+    fn damage_player(
+        &mut self,
+        network: &mut NetworkManager,
+        id: ConnectionId,
+        amount: f32,
+        death_message: String,
+        tick: u64,
+    ) {
+        let immune = match self.players.get(id) {
+            Some(player) => {
+                player.dead || matches!(player.gamemode, GameMode::Creative | GameMode::Spectator)
+            }
+            None => return,
+        };
+        if immune || amount <= 0.0 {
+            return;
+        }
+        let died = match self.players.get_mut(id) {
+            Some(player) => {
+                player.health -= amount;
+                player.last_damage_tick = tick;
+                if player.health <= 0.0 {
+                    player.health = 0.0;
+                    player.dead = true;
+                    player.fall_start = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => return,
+        };
+        self.sync_health(network, id);
+        if died {
+            info!("{death_message}");
+            self.broadcast_chat(network, &death_message);
+        }
+    }
+
+    fn tick_regen(&mut self, network: &mut NetworkManager, id: ConnectionId, tick: u64) {
+        let heal = match self.players.get_mut(id) {
+            Some(player) if !player.dead && player.health < MAX_HEALTH => {
+                let since = tick.saturating_sub(player.last_damage_tick);
+                if since >= REGEN_DELAY_TICKS
+                    && (since - REGEN_DELAY_TICKS) % REGEN_PERIOD_TICKS == 0
+                {
+                    player.health = (player.health + 1.0).min(MAX_HEALTH);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if heal {
+            self.sync_health(network, id);
+        }
+    }
+
+    fn overworld_dimension_type() -> i32 {
+        default_registries()
+            .iter()
+            .find(|registry| registry.id == "minecraft:dimension_type")
+            .and_then(|registry| registry.entry_index("minecraft:overworld"))
+            .unwrap_or(0) as i32
+    }
+
+    /// Respawns a dead player at spawn with full health. Inventory is kept
+    /// (documented simplification, not vanilla behavior).
+    fn do_respawn(&mut self, id: ConnectionId, network: &mut NetworkManager) {
+        let Some(player) = self.players.get_mut(id) else {
+            return;
+        };
+        if !player.dead {
+            return;
+        }
+        player.x = crate::world::SPAWN_X;
+        player.y = crate::world::SPAWN_Y;
+        player.z = crate::world::SPAWN_Z;
+        player.yaw = crate::world::SPAWN_YAW;
+        player.pitch = crate::world::SPAWN_PITCH;
+        player.vx = 0.0;
+        player.vy = 0.0;
+        player.vz = 0.0;
+        player.on_ground = false;
+        player.health = MAX_HEALTH;
+        player.dead = false;
+        player.fall_start = None;
+        player.grounded_once = false;
+        let dimension_type_id = Self::overworld_dimension_type();
+        let player_snapshot = player.clone();
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.inv_dirty = true;
+            // The client unloads everything on death: forget streamed
+            // chunks and tracked entities so the next pumps re-send them.
+            // Otherwise the player respawns into an eternal loading screen.
+            session.chunk_center = None;
+            session.sent_chunks.clear();
+            session.tracked.clear();
+            session.drop_tracked.clear();
+        }
+        if let Some(conn) = network.connection_mut(id) {
+            send_response(conn, &encode_respawn(&player_snapshot, dimension_type_id));
+        }
+        self.sync_health(network, id);
+        if let (Some(session), Some(conn), Some(player)) = (
+            self.sessions.get_mut(&id),
+            network.connection_mut(id),
+            self.players.get(id),
+        ) {
+            let teleport_id = session.teleport_id;
+            send_response(
+                conn,
+                &encode_sync_position(
+                    player.x,
+                    player.y,
+                    player.z,
+                    player.yaw,
+                    player.pitch,
+                    teleport_id,
+                ),
+            );
+            if !conn.is_closed() {
+                session.teleport_id += 1;
+            }
+        }
+        info!("Player {} respawned", player_snapshot.name);
     }
 
     pub fn pump_visibility(&mut self, network: &mut NetworkManager) {
@@ -1011,6 +1225,9 @@ impl JavaHandler {
         // (Spectator clients predict nothing, so silence needs no correction.)
         if matches!(player.gamemode, GameMode::Spectator | GameMode::Adventure) {
             debug!("connection {id} edit ignored in {:?}", player.gamemode);
+            return;
+        }
+        if player.dead {
             return;
         }
         let held = player.held_item();
@@ -1812,11 +2029,7 @@ impl JavaHandler {
         let Some(player) = self.players.get(id).cloned() else {
             return;
         };
-        let dimension_type_id = default_registries()
-            .iter()
-            .find(|registry| registry.id == "minecraft:dimension_type")
-            .and_then(|registry| registry.entry_index("minecraft:overworld"))
-            .unwrap_or(0) as i32;
+        let dimension_type_id = Self::overworld_dimension_type();
         send_response(
             conn,
             &encode_play_login(&player, self.status.max_players, dimension_type_id),
@@ -1970,9 +2183,28 @@ impl JavaHandler {
         }
     }
 
-    fn run_chat_command(&mut self, id: ConnectionId, network: &mut NetworkManager, command: &str) {
+    fn run_chat_command(
+        &mut self,
+        id: ConnectionId,
+        network: &mut NetworkManager,
+        command: &str,
+        tick: u64,
+    ) {
         let mut words = command.split_whitespace();
         match words.next() {
+            Some(word) if word.eq_ignore_ascii_case("kill") => {
+                let name = match self.players.get(id) {
+                    Some(player) if !player.dead => player.name.clone(),
+                    _ => return,
+                };
+                self.damage_player(
+                    network,
+                    id,
+                    f32::INFINITY,
+                    format!("{name} was killed"),
+                    tick,
+                );
+            }
             Some(word) if word.eq_ignore_ascii_case("gamemode") => {
                 let mode = match words.next().and_then(parse_gamemode) {
                     Some(mode) => mode,
@@ -2057,7 +2289,7 @@ impl JavaHandler {
                 self.send_chat(
                     network,
                     id,
-                    "Commands: /gamemode <mode> [player], /list, /save, /help",
+                    "Commands: /gamemode <mode> [player], /kill, /list, /save, /help",
                 );
             }
             _ => {
@@ -2102,6 +2334,7 @@ enum PacketAction {
     ChatCommand(String),
     ChatMessage(String),
     KeepAliveAck(i64),
+    Respawn,
     SelectSlot(u8),
     HeldEcho,
     Click(PendingClick),
@@ -2285,6 +2518,23 @@ fn handle_packet(
             });
         }
         (ProtocolState::Play, 0x21) => {}
+        (ProtocolState::Play, 0x0C) => {
+            // Client Status: action 0 is the respawn click on the death
+            // screen; 1/2 (stats, game rules) have nothing to answer with.
+            let mut reader = Reader::new(payload);
+            if let Ok(action) = reader.read_varint() {
+                if reader.remaining() == 0 {
+                    if action == 0 {
+                        return Ok(PacketAction::Respawn);
+                    }
+                    return Ok(PacketAction::None);
+                }
+            }
+            debug!(
+                "connection {} client status with unexpected shape tolerated",
+                session.id
+            );
+        }
         (ProtocolState::Play, 0x28) => {
             // Player Abilities: the client reports flying toggles here.
             let mut reader = Reader::new(payload);
@@ -2508,6 +2758,17 @@ fn handle_packet(
         _ => return Err(ProtoError::UnknownPacket(id)),
     }
     Ok(PacketAction::None)
+}
+
+/// Every chunk position a viewer at `center` needs streamed.
+fn desired_chunks(center: ChunkPos) -> HashSet<ChunkPos> {
+    let mut desired = HashSet::new();
+    for dx in -CHUNK_RADIUS..=CHUNK_RADIUS {
+        for dz in -CHUNK_RADIUS..=CHUNK_RADIUS {
+            desired.insert(ChunkPos::new(center.x + dx, center.z + dz));
+        }
+    }
+    desired
 }
 
 fn collides(world: &World, x: f64, y: f64, z: f64) -> bool {
@@ -3449,6 +3710,51 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn far_chunks_evict_from_server_memory() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "FarPlayer");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        let mut worlds = WorldManager::create_default();
+        drain_stream(&mut stack, &mut worlds, &mut client);
+        assert!(worlds
+            .get(DEFAULT_WORLD_NAME)
+            .unwrap()
+            .is_chunk_loaded(ChunkPos::new(0, 0)));
+
+        // Teleport far away; streaming follows and the old area is reclaimed.
+        // No store attached, but untouched chunks are clean and safe to drop.
+        stack.1.players.get_mut(1).unwrap().x = 1000.0;
+        for _ in 0..60 {
+            stack.1.pump_chunks(&mut stack.0, &mut worlds);
+            stack.0.poll();
+        }
+        // Drain the new area so the outbox never blocks the assertions.
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        for _ in 0..300 {
+            let mut probe = [0u8; 1];
+            if client.stream.peek(&mut probe).is_err() {
+                break;
+            }
+            client.read_packet();
+        }
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let world = worlds.get(DEFAULT_WORLD_NAME).unwrap();
+        assert!(!world.is_chunk_loaded(ChunkPos::new(0, 0)));
+        assert!(world.is_chunk_loaded(ChunkPos::new(62, 0)));
+    }
+
     fn send_move(client: &mut ScriptClient, id: i32, body: &[u8]) {
         client.send_packet(id, body);
     }
@@ -3648,8 +3954,8 @@ mod tests {
         drain_stream(&mut stack, &mut worlds, &mut client);
 
         let mut speeds = Vec::new();
-        for _ in 0..300 {
-            stack.1.tick_physics(&mut stack.0, &worlds);
+        for tick in 1..300 {
+            stack.1.tick_physics(&mut stack.0, &worlds, tick);
             let player = stack.1.players.get(1).unwrap();
             if speeds.len() < 3 {
                 speeds.push(player.vy);
@@ -3691,7 +3997,7 @@ mod tests {
         drain_stream(&mut stack, &mut worlds, &mut client);
 
         stack.1.players.get_mut(1).unwrap().y = 60.0;
-        stack.1.tick_physics(&mut stack.0, &worlds);
+        stack.1.tick_physics(&mut stack.0, &worlds, 1);
         assert_eq!(stack.1.players.get(1).unwrap().y, 65.0);
 
         let (id, payload) = client.read_packet();
@@ -3701,6 +4007,254 @@ mod tests {
         assert_eq!(reader.read_f64().unwrap(), 0.0);
         assert_eq!(reader.read_f64().unwrap(), 65.0);
         assert_eq!(reader.read_f64().unwrap(), 0.0);
+    }
+
+    fn read_health(client: &mut ScriptClient) -> f32 {
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x68);
+        let mut reader = Reader::new(&payload);
+        let health = reader.read_f32().unwrap();
+        assert_eq!(reader.read_varint().unwrap(), 20);
+        assert_eq!(reader.read_f32().unwrap(), 5.0);
+        assert_eq!(reader.remaining(), 0);
+        health
+    }
+
+    #[test]
+    fn fall_damage_hurts_and_syncs_health() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "Faller");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        let mut worlds = lowered_worlds(&mut stack);
+        // First landing only arms fall tracking (spawn protection).
+        for tick in 1..300 {
+            stack.1.tick_physics(&mut stack.0, &worlds, tick);
+            if stack.1.players.get(1).unwrap().on_ground {
+                break;
+            }
+        }
+        // A 15-block fall deals 12 damage.
+        stack.1.players.get_mut(1).unwrap().y = 80.0;
+        stack.1.players.get_mut(1).unwrap().vy = 0.0;
+        stack.1.players.get_mut(1).unwrap().on_ground = false;
+        for tick in 100..400 {
+            stack.1.tick_physics(&mut stack.0, &worlds, tick);
+            if stack.1.players.get(1).unwrap().on_ground {
+                break;
+            }
+        }
+        let player = stack.1.players.get(1).unwrap();
+        assert!(player.on_ground);
+        assert!(!player.dead);
+        assert_eq!(player.health, 8.0);
+        assert_eq!(read_health(&mut client), 8.0);
+    }
+
+    #[test]
+    fn short_falls_and_creative_are_safe() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "Careful");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        let mut worlds = lowered_worlds(&mut stack);
+        for tick in 1..300 {
+            stack.1.tick_physics(&mut stack.0, &worlds, tick);
+            if stack.1.players.get(1).unwrap().on_ground {
+                break;
+            }
+        }
+        // A 3-block hop never hurts.
+        stack.1.players.get_mut(1).unwrap().y = 68.0;
+        stack.1.players.get_mut(1).unwrap().vy = 0.0;
+        stack.1.players.get_mut(1).unwrap().on_ground = false;
+        for tick in 100..400 {
+            stack.1.tick_physics(&mut stack.0, &worlds, tick);
+            if stack.1.players.get(1).unwrap().on_ground {
+                break;
+            }
+        }
+        assert_eq!(stack.1.players.get(1).unwrap().health, 20.0);
+        expect_silence(&mut client);
+
+        // Creative players are immune to any fall.
+        stack.1.players.get_mut(1).unwrap().gamemode = GameMode::Creative;
+        stack.1.players.get_mut(1).unwrap().y = 100.0;
+        stack.1.players.get_mut(1).unwrap().vy = 0.0;
+        stack.1.players.get_mut(1).unwrap().on_ground = false;
+        for tick in 400..700 {
+            stack.1.tick_physics(&mut stack.0, &worlds, tick);
+            if stack.1.players.get(1).unwrap().on_ground {
+                break;
+            }
+        }
+        assert_eq!(stack.1.players.get(1).unwrap().health, 20.0);
+        expect_silence(&mut client);
+    }
+
+    #[test]
+    fn void_kill_respawn_and_dead_cannot_edit() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "Doomed");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        let mut worlds = lowered_worlds(&mut stack);
+
+        stack.1.players.get_mut(1).unwrap().y = -100.0;
+        stack.1.tick_physics(&mut stack.0, &worlds, 50);
+        let player = stack.1.players.get(1).unwrap();
+        assert!(player.dead);
+        assert_eq!(player.health, 0.0);
+        assert_eq!(read_health(&mut client), 0.0);
+        assert!(read_system_chat(&mut client).contains("fell out"));
+
+        // The dead cannot break blocks.
+        send_dig(&mut client, 2, 0, 64, 0, 1, 80);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
+        assert_eq!(
+            worlds
+                .get(crate::world::DEFAULT_WORLD_NAME)
+                .unwrap()
+                .get_block(0, 64, 0),
+            Some(crate::world::Block::GrassBlock)
+        );
+        expect_silence(&mut client);
+
+        // Clicking respawn brings them back to spawn, whole again.
+        let mut respawn = Writer::new();
+        respawn.write_varint(0);
+        client.send_packet(0x0C, &respawn.into_bytes());
+        settle(&mut stack);
+        let player = stack.1.players.get(1).unwrap();
+        assert!(!player.dead);
+        assert_eq!(player.health, 20.0);
+        assert_eq!(
+            (player.x, player.y, player.z),
+            (
+                crate::world::SPAWN_X,
+                crate::world::SPAWN_Y,
+                crate::world::SPAWN_Z
+            )
+        );
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x52);
+        assert_eq!(read_health(&mut client), 20.0);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x48);
+    }
+
+    #[test]
+    fn respawn_restarts_chunk_stream() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "Respawner");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        let mut worlds = WorldManager::create_default();
+        drain_stream(&mut stack, &mut worlds, &mut client);
+
+        // Die and respawn: the client unloads the world on death, so the
+        // server must open a fresh stream instead of staying silent.
+        send_chat(&mut client, "kill");
+        settle(&mut stack);
+        assert!(stack.1.players.get(1).unwrap().dead);
+        assert_eq!(read_health(&mut client), 0.0);
+        assert!(read_system_chat(&mut client).contains("was killed"));
+
+        let mut respawn = Writer::new();
+        respawn.write_varint(0);
+        client.send_packet(0x0C, &respawn.into_bytes());
+        settle(&mut stack);
+        assert!(!stack.1.players.get(1).unwrap().dead);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x52);
+        assert_eq!(read_health(&mut client), 20.0);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x48);
+
+        stack.1.pump_chunks(&mut stack.0, &mut worlds);
+        stack.0.poll();
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x26); // start-chunks event opens the new stream
+        assert_eq!(payload[0], 13);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x5E);
+        let (id, _) = client.read_packet();
+        assert_eq!(id, 0x0C);
+        let (id, payload) = client.read_packet();
+        assert_eq!(id, 0x2D);
+        assert_eq!(Reader::new(&payload).read_i32().unwrap(), -6);
+    }
+
+    #[test]
+    fn health_regenerates_over_time() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "Healer");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        let mut worlds = lowered_worlds(&mut stack);
+        for tick in 1..300 {
+            stack.1.tick_physics(&mut stack.0, &worlds, tick);
+            if stack.1.players.get(1).unwrap().on_ground {
+                break;
+            }
+        }
+        stack.1.players.get_mut(1).unwrap().y = 80.0;
+        stack.1.players.get_mut(1).unwrap().vy = 0.0;
+        stack.1.players.get_mut(1).unwrap().on_ground = false;
+        let mut hurt_tick = 0;
+        for tick in 100..400 {
+            stack.1.tick_physics(&mut stack.0, &worlds, tick);
+            if stack.1.players.get(1).unwrap().health < 20.0 {
+                hurt_tick = tick;
+                break;
+            }
+        }
+        assert_eq!(stack.1.players.get(1).unwrap().health, 8.0);
+        assert_eq!(read_health(&mut client), 8.0);
+        // Nothing heals during the delay window, then +1 per period.
+        for tick in hurt_tick + 1..=hurt_tick + 200 {
+            stack.1.tick_physics(&mut stack.0, &worlds, tick);
+        }
+        assert_eq!(stack.1.players.get(1).unwrap().health, 9.0);
+        assert_eq!(read_health(&mut client), 9.0);
+    }
+
+    #[test]
+    fn chat_kill_kills_and_broadcasts() {
+        let mut stack = test_stack();
+        let addr = stack.2;
+        let mut client = ScriptClient::connect(addr);
+        wait_until(&mut stack, |n| n.connection_count() == 1);
+        join_play(&mut stack, &mut client, "Victim");
+        for _ in 0..3 {
+            client.read_packet();
+        }
+        send_chat(&mut client, "kill");
+        settle(&mut stack);
+        assert!(stack.1.players.get(1).unwrap().dead);
+        assert_eq!(read_health(&mut client), 0.0);
+        assert!(read_system_chat(&mut client).contains("was killed"));
     }
 
     #[test]
@@ -3729,7 +4283,7 @@ mod tests {
             player.x = 0.5;
             player.y = 64.2;
             player.z = 0.5;
-            stack.1.tick_physics(&mut stack.0, &worlds);
+            stack.1.tick_physics(&mut stack.0, &worlds, 1);
             let player = stack.1.players.get(1).unwrap();
             if snaps {
                 assert_eq!((player.x, player.z), (0.0, 0.0));
@@ -5251,6 +5805,7 @@ mod tests {
                 pitch: 0.0,
                 gamemode: "creative".to_owned(),
                 flying: false,
+                health: 13.0,
                 selected: 1,
                 inventory,
                 cursor: (1, 2),
@@ -5266,6 +5821,7 @@ mod tests {
         }
         let player = stack.1.players.get(1).unwrap();
         assert_eq!((player.x, player.y, player.z), (10.5, 66.0, -3.5));
+        assert_eq!(player.health, 13.0);
         assert_eq!(player.gamemode, GameMode::Creative);
         assert_eq!(player.inventory.selected(), 1);
         assert_eq!(
@@ -5541,8 +6097,8 @@ mod tests {
         move_body.write_u8(1);
         send_move(&mut client, 0x1F, &move_body.into_bytes());
         settle(&mut stack);
-        for _ in 0..5 {
-            stack.1.tick_physics(&mut stack.0, &worlds);
+        for tick in 1..5 {
+            stack.1.tick_physics(&mut stack.0, &worlds, tick);
         }
         expect_silence(&mut client);
         assert!((stack.1.players.get(1).unwrap().y - 90.0).abs() < 0.001);

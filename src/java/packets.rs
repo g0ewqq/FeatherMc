@@ -222,6 +222,35 @@ pub fn encode_system_chat(text: &str) -> Vec<u8> {
     encode_packet(0x79, &body.into_bytes())
 }
 
+/// Syncs hearts (and stubbed food) to the client. Health at or below zero
+/// shows the death screen.
+pub fn encode_health(health: f32) -> Vec<u8> {
+    let mut body = Writer::new();
+    body.write_f32(health);
+    body.write_varint(20); // food: hunger is not simulated
+    body.write_f32(5.0); // saturation
+    encode_packet(0x68, &body.into_bytes())
+}
+
+/// Re-spawns a dead player. Mirrors the dimension fields of play login plus
+/// the respawn-only tail; data-kept is zero (normal death keeps no
+/// client-side data; the server separately keeps the inventory).
+pub fn encode_respawn(player: &PlayerSession, dimension_type_id: i32) -> Vec<u8> {
+    let mut body = Writer::new();
+    body.write_varint(dimension_type_id);
+    body.write_string(&player.dimension);
+    body.write_i64(0); // hashed seed
+    body.write_u8(player.gamemode as u8);
+    body.write_i8(-1); // no previous game mode
+    body.write_bool(false); // debug world
+    body.write_bool(true); // flat world
+    body.write_bool(false); // no death location
+    body.write_varint(0); // portal cooldown
+    body.write_varint(SEA_LEVEL);
+    body.write_u8(0); // data kept: none
+    encode_packet(0x52, &body.into_bytes())
+}
+
 pub fn encode_block_update(x: i32, y: i32, z: i32, state: i32) -> Vec<u8> {
     let mut body = Writer::new();
     body.write_position(x, y, z);
@@ -726,6 +755,36 @@ mod tests {
             crate::java::nbt::NbtTag::String("Hello there".to_owned())
         );
         assert!(!reader.read_bool().unwrap());
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn health_and_respawn_encode() {
+        let bytes = encode_health(7.5);
+        let (len, header) = decode_varint_prefix(&bytes).unwrap().unwrap();
+        let mut reader = Reader::new(&bytes[header..header + len as usize]);
+        assert_eq!(reader.read_varint().unwrap(), 0x68);
+        assert_eq!(reader.read_f32().unwrap(), 7.5);
+        assert_eq!(reader.read_varint().unwrap(), 20);
+        assert_eq!(reader.read_f32().unwrap(), 5.0);
+        assert_eq!(reader.remaining(), 0);
+
+        let player = PlayerSession::new(1, "Steve".to_owned(), None, 776, 3, 9999);
+        let bytes = encode_respawn(&player, 0);
+        let (len, header) = decode_varint_prefix(&bytes).unwrap().unwrap();
+        let mut reader = Reader::new(&bytes[header..header + len as usize]);
+        assert_eq!(reader.read_varint().unwrap(), 0x52);
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.read_string().unwrap(), "minecraft:overworld");
+        assert_eq!(reader.read_i64().unwrap(), 0);
+        assert_eq!(reader.read_u8().unwrap(), 0); // survival
+        assert_eq!(reader.read_i8().unwrap(), -1);
+        assert!(!reader.read_bool().unwrap());
+        assert!(reader.read_bool().unwrap()); // flat
+        assert!(!reader.read_bool().unwrap()); // no death location
+        assert_eq!(reader.read_varint().unwrap(), 0);
+        assert_eq!(reader.read_varint().unwrap(), 63);
+        assert_eq!(reader.read_u8().unwrap(), 0);
         assert_eq!(reader.remaining(), 0);
     }
 

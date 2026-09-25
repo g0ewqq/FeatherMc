@@ -129,6 +129,10 @@ impl WorldStore {
 /// and out-of-range counts get skipped on load. The uuid and entity/session ids
 /// are deliberately not stored — login supplies the uuid, and every session
 /// mints fresh ids.
+fn full_health() -> f32 {
+    20.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerData {
     pub name: String,
@@ -140,6 +144,8 @@ pub struct PlayerData {
     pub pitch: f32,
     pub gamemode: String,
     pub flying: bool,
+    #[serde(default = "full_health")]
+    pub health: f32,
     pub selected: u8,
     pub inventory: Vec<(i32, u32)>,
     pub cursor: (i32, u32),
@@ -254,6 +260,7 @@ mod tests {
             pitch: 0.0,
             gamemode: "creative".to_owned(),
             flying: true,
+            health: 7.5,
             selected: 2,
             inventory: vec![(1, 64), (0, 0)],
             cursor: (28, 3),
@@ -263,6 +270,7 @@ mod tests {
         assert!(store.player_file("Steve!").ends_with("Steve_.toml"));
         let back = store.load_player("Steve!").unwrap();
         assert_eq!(back.x, 1.5);
+        assert_eq!(back.health, 7.5);
         assert_eq!(back.gamemode, "creative");
         assert_eq!(back.inventory[0], (1, 64));
         assert_eq!(back.cursor, (28, 3));
