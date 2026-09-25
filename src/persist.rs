@@ -241,7 +241,11 @@ mod tests {
     fn stack_of_skips_unknown_or_invalid() {
         assert!(PlayerData::stack_of(0, 0).is_empty());
         assert!(PlayerData::stack_of(1, 0).is_empty());
-        assert!(PlayerData::stack_of(99, 5).is_empty());
+        assert_eq!(
+            PlayerData::stack_of(99, 5).item,
+            crate::inventory::Item::ExposedChiseledCopper
+        );
+        assert!(PlayerData::stack_of(99999, 5).is_empty());
         assert!(PlayerData::stack_of(1, 65).is_empty());
         assert_eq!(PlayerData::stack_of(1, 5).count, 5);
     }

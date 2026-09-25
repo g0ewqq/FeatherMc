@@ -56,8 +56,239 @@ const BLOCK_REACH: f64 = 7.0;
 fn break_ticks(block: Block) -> u64 {
     match block {
         Block::Air => u64::MAX,
-        Block::Stone => 150,
-        Block::Dirt | Block::GrassBlock => 15,
+        Block::Stone | Block::Cobblestone | Block::Bricks => 150,
+        Block::OakPlanks | Block::OakLog => 40,
+        Block::Dirt | Block::GrassBlock | Block::Sand | Block::Gravel => 15,
+        Block::WhiteWool => 12,
+        Block::Glass | Block::Glowstone => 8,
+        Block::Obsidian => 600,
+        Block::Granite => 60, // h=1.5
+        Block::PolishedGranite => 60, // h=1.5
+        Block::Diorite => 60, // h=1.5
+        Block::PolishedDiorite => 60, // h=1.5
+        Block::Andesite => 60, // h=1.5
+        Block::PolishedAndesite => 60, // h=1.5
+        Block::CoarseDirt => 15, // h=0.5
+        Block::SprucePlanks => 40, // h=2
+        Block::BirchPlanks => 40, // h=2
+        Block::JunglePlanks => 40, // h=2
+        Block::AcaciaPlanks => 40, // h=2
+        Block::CherryPlanks => 40, // h=2
+        Block::DarkOakPlanks => 40, // h=2
+        Block::PaleOakPlanks => 40, // h=2
+        Block::MangrovePlanks => 40, // h=2
+        Block::BambooPlanks => 40, // h=2
+        Block::BambooMosaic => 60, // h=2
+        Block::RedSand => 15, // h=0.5
+        Block::GoldOre => 150, // h=3
+        Block::DeepslateGoldOre => 250, // h=4.5
+        Block::IronOre => 150, // h=3
+        Block::DeepslateIronOre => 250, // h=4.5
+        Block::CoalOre => 150, // h=3
+        Block::DeepslateCoalOre => 250, // h=4.5
+        Block::NetherGoldOre => 150, // h=3
+        Block::Sponge => 15, // h=0.6
+        Block::WetSponge => 15, // h=0.6
+        Block::LapisOre => 150, // h=3
+        Block::DeepslateLapisOre => 250, // h=4.5
+        Block::LapisBlock => 150, // h=3
+        Block::Sandstone => 15, // h=0.8
+        Block::ChiseledSandstone => 15, // h=0.8
+        Block::CutSandstone => 15, // h=0.8
+        Block::OrangeWool => 12, // h=0.8
+        Block::MagentaWool => 12, // h=0.8
+        Block::LightBlueWool => 12, // h=0.8
+        Block::YellowWool => 12, // h=0.8
+        Block::LimeWool => 12, // h=0.8
+        Block::PinkWool => 12, // h=0.8
+        Block::GrayWool => 12, // h=0.8
+        Block::LightGrayWool => 12, // h=0.8
+        Block::CyanWool => 12, // h=0.8
+        Block::PurpleWool => 12, // h=0.8
+        Block::BlueWool => 12, // h=0.8
+        Block::BrownWool => 12, // h=0.8
+        Block::GreenWool => 12, // h=0.8
+        Block::RedWool => 12, // h=0.8
+        Block::BlackWool => 12, // h=0.8
+        Block::GoldBlock => 150, // h=3
+        Block::IronBlock => 250, // h=5
+        Block::Bookshelf => 40, // h=1.5
+        Block::MossyCobblestone => 60, // h=2
+        Block::DiamondOre => 150, // h=3
+        Block::DeepslateDiamondOre => 250, // h=4.5
+        Block::DiamondBlock => 250, // h=5
+        Block::CraftingTable => 40, // h=2.5
+        Block::Clay => 15, // h=0.6
+        Block::Netherrack => 15, // h=0.4
+        Block::SoulSand => 15, // h=0.5
+        Block::SoulSoil => 15, // h=0.5
+        Block::WhiteStainedGlass => 8, // h=0.3
+        Block::OrangeStainedGlass => 8, // h=0.3
+        Block::MagentaStainedGlass => 8, // h=0.3
+        Block::LightBlueStainedGlass => 8, // h=0.3
+        Block::YellowStainedGlass => 8, // h=0.3
+        Block::LimeStainedGlass => 8, // h=0.3
+        Block::PinkStainedGlass => 8, // h=0.3
+        Block::GrayStainedGlass => 8, // h=0.3
+        Block::LightGrayStainedGlass => 8, // h=0.3
+        Block::CyanStainedGlass => 8, // h=0.3
+        Block::PurpleStainedGlass => 8, // h=0.3
+        Block::BlueStainedGlass => 8, // h=0.3
+        Block::BrownStainedGlass => 8, // h=0.3
+        Block::GreenStainedGlass => 8, // h=0.3
+        Block::RedStainedGlass => 8, // h=0.3
+        Block::BlackStainedGlass => 8, // h=0.3
+        Block::StoneBricks => 60, // h=1.5
+        Block::MossyStoneBricks => 60, // h=1.5
+        Block::CrackedStoneBricks => 60, // h=1.5
+        Block::ChiseledStoneBricks => 60, // h=1.5
+        Block::PackedMud => 15, // h=1
+        Block::MudBricks => 60, // h=1.5
+        Block::Pumpkin => 15, // h=1
+        Block::Melon => 15, // h=1
+        Block::ResinBlock => 8, // h=0
+        Block::ResinBricks => 60, // h=1.5
+        Block::ChiseledResinBricks => 60, // h=1.5
+        Block::NetherBricks => 60, // h=2
+        Block::EnchantingTable => 40, // h=5
+        Block::EndStone => 150, // h=3
+        Block::EmeraldOre => 150, // h=3
+        Block::DeepslateEmeraldOre => 250, // h=4.5
+        Block::EmeraldBlock => 250, // h=5
+        Block::RedstoneBlock => 250, // h=5
+        Block::NetherQuartzOre => 150, // h=3
+        Block::QuartzBlock => 15, // h=0.8
+        Block::ChiseledQuartzBlock => 15, // h=0.8
+        Block::WhiteTerracotta => 60, // h=1.25
+        Block::OrangeTerracotta => 60, // h=1.25
+        Block::MagentaTerracotta => 60, // h=1.25
+        Block::LightBlueTerracotta => 60, // h=1.25
+        Block::YellowTerracotta => 60, // h=1.25
+        Block::LimeTerracotta => 60, // h=1.25
+        Block::PinkTerracotta => 60, // h=1.25
+        Block::GrayTerracotta => 60, // h=1.25
+        Block::LightGrayTerracotta => 60, // h=1.25
+        Block::CyanTerracotta => 60, // h=1.25
+        Block::PurpleTerracotta => 60, // h=1.25
+        Block::BlueTerracotta => 60, // h=1.25
+        Block::BrownTerracotta => 60, // h=1.25
+        Block::GreenTerracotta => 60, // h=1.25
+        Block::RedTerracotta => 60, // h=1.25
+        Block::BlackTerracotta => 60, // h=1.25
+        Block::Prismarine => 60, // h=1.5
+        Block::PrismarineBricks => 60, // h=1.5
+        Block::DarkPrismarine => 60, // h=1.5
+        Block::SeaLantern => 8, // h=0.3
+        Block::Terracotta => 60, // h=1.25
+        Block::CoalBlock => 250, // h=5
+        Block::PackedIce => 15, // h=0.5
+        Block::RedSandstone => 15, // h=0.8
+        Block::ChiseledRedSandstone => 15, // h=0.8
+        Block::CutRedSandstone => 15, // h=0.8
+        Block::SmoothStone => 60, // h=2
+        Block::SmoothSandstone => 60, // h=2
+        Block::SmoothQuartz => 60, // h=2
+        Block::SmoothRedSandstone => 60, // h=2
+        Block::PurpurBlock => 60, // h=1.5
+        Block::EndStoneBricks => 150, // h=3
+        Block::NetherWartBlock => 15, // h=1
+        Block::RedNetherBricks => 60, // h=2
+        Block::WhiteConcrete => 60, // h=1.8
+        Block::OrangeConcrete => 60, // h=1.8
+        Block::MagentaConcrete => 60, // h=1.8
+        Block::LightBlueConcrete => 60, // h=1.8
+        Block::YellowConcrete => 60, // h=1.8
+        Block::LimeConcrete => 60, // h=1.8
+        Block::PinkConcrete => 60, // h=1.8
+        Block::GrayConcrete => 60, // h=1.8
+        Block::LightGrayConcrete => 60, // h=1.8
+        Block::CyanConcrete => 60, // h=1.8
+        Block::PurpleConcrete => 60, // h=1.8
+        Block::BlueConcrete => 60, // h=1.8
+        Block::BrownConcrete => 60, // h=1.8
+        Block::GreenConcrete => 60, // h=1.8
+        Block::RedConcrete => 60, // h=1.8
+        Block::BlackConcrete => 60, // h=1.8
+        Block::DriedKelpBlock => 15, // h=0.5
+        Block::DeadTubeCoralBlock => 60, // h=1.5
+        Block::DeadBrainCoralBlock => 60, // h=1.5
+        Block::DeadBubbleCoralBlock => 60, // h=1.5
+        Block::DeadFireCoralBlock => 60, // h=1.5
+        Block::DeadHornCoralBlock => 60, // h=1.5
+        Block::BlueIce => 150, // h=2.8
+        Block::CartographyTable => 40, // h=2.5
+        Block::FletchingTable => 40, // h=2.5
+        Block::SmithingTable => 40, // h=2.5
+        Block::WarpedNylium => 15, // h=0.4
+        Block::WarpedWartBlock => 15, // h=1
+        Block::CrimsonNylium => 15, // h=0.4
+        Block::Shroomlight => 15, // h=1
+        Block::CrimsonPlanks => 40, // h=2
+        Block::WarpedPlanks => 40, // h=2
+        Block::HoneycombBlock => 15, // h=0.6
+        Block::NetheriteBlock => 600, // h=50
+        Block::AncientDebris => 600, // h=30
+        Block::CryingObsidian => 600, // h=50
+        Block::Lodestone => 150, // h=3.5
+        Block::Blackstone => 60, // h=1.5
+        Block::PolishedBlackstone => 60, // h=2
+        Block::PolishedBlackstoneBricks => 60, // h=1.5
+        Block::CrackedPolishedBlackstoneBricks => 60, // h=1.5
+        Block::ChiseledPolishedBlackstone => 60, // h=1.5
+        Block::GildedBlackstone => 60, // h=1.5
+        Block::ChiseledNetherBricks => 60, // h=2
+        Block::CrackedNetherBricks => 60, // h=2
+        Block::QuartzBricks => 15, // h=0.8
+        Block::AmethystBlock => 60, // h=1.5
+        Block::Tuff => 60, // h=1.5
+        Block::PolishedTuff => 60, // h=1.5
+        Block::ChiseledTuff => 60, // h=1.5
+        Block::TuffBricks => 60, // h=1.5
+        Block::ChiseledTuffBricks => 60, // h=1.5
+        Block::Calcite => 15, // h=0.75
+        Block::TintedGlass => 8, // h=0.3
+        Block::CopperBlock => 150, // h=3
+        Block::ExposedCopper => 150, // h=3
+        Block::WeatheredCopper => 150, // h=3
+        Block::OxidizedCopper => 150, // h=3
+        Block::CopperOre => 150, // h=3
+        Block::DeepslateCopperOre => 250, // h=4.5
+        Block::OxidizedCutCopper => 150, // h=3
+        Block::WeatheredCutCopper => 150, // h=3
+        Block::ExposedCutCopper => 150, // h=3
+        Block::CutCopper => 150, // h=3
+        Block::OxidizedChiseledCopper => 150, // h=3
+        Block::WeatheredChiseledCopper => 150, // h=3
+        Block::ExposedChiseledCopper => 150, // h=3
+        Block::ChiseledCopper => 150, // h=3
+        Block::WaxedOxidizedChiseledCopper => 150, // h=3
+        Block::WaxedWeatheredChiseledCopper => 150, // h=3
+        Block::WaxedExposedChiseledCopper => 150, // h=3
+        Block::WaxedChiseledCopper => 150, // h=3
+        Block::WaxedCopperBlock => 150, // h=3
+        Block::WaxedWeatheredCopper => 150, // h=3
+        Block::WaxedExposedCopper => 150, // h=3
+        Block::WaxedOxidizedCopper => 150, // h=3
+        Block::WaxedOxidizedCutCopper => 150, // h=3
+        Block::WaxedWeatheredCutCopper => 150, // h=3
+        Block::WaxedExposedCutCopper => 150, // h=3
+        Block::WaxedCutCopper => 150, // h=3
+        Block::DripstoneBlock => 60, // h=1.5
+        Block::MossBlock => 8, // h=0.1
+        Block::RootedDirt => 15, // h=0.5
+        Block::Mud => 15, // h=0.5
+        Block::CobbledDeepslate => 150, // h=3.5
+        Block::PolishedDeepslate => 150, // h=3.5
+        Block::DeepslateTiles => 150, // h=3.5
+        Block::DeepslateBricks => 150, // h=3.5
+        Block::ChiseledDeepslate => 150, // h=3.5
+        Block::CrackedDeepslateBricks => 150, // h=3.5
+        Block::CrackedDeepslateTiles => 150, // h=3.5
+        Block::SmoothBasalt => 60, // h=1.25
+        Block::RawIronBlock => 250, // h=5
+        Block::RawCopperBlock => 250, // h=5
+        Block::RawGoldBlock => 250, // h=5
+        Block::PaleMossBlock => 8, // h=0.1
     }
 }
 
@@ -4912,6 +5143,80 @@ mod tests {
             assert_eq!(reader.read_varint().unwrap(), 0);
         }
         assert_eq!(reader.read_varint().unwrap(), 63);
+    }
+
+    #[test]
+    fn new_palette_blocks_place_and_break_with_timing() {
+        let mut stack = test_stack();
+        let (mut first, _) = join_pair(&mut stack);
+        seed_visible(&mut stack, 1);
+        let mut worlds = lowered_worlds(&mut stack);
+        stack.1.players.get_mut(1).unwrap().inventory.set(
+            36,
+            crate::inventory::ItemStack::new(crate::inventory::Item::Glass, 64).unwrap(),
+        );
+
+        // Glass places with its vanilla state and consumes one item.
+        send_place(&mut first, 0, 64, 0, 1, 21);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
+        assert_eq!(
+            worlds
+                .get(crate::world::DEFAULT_WORLD_NAME)
+                .unwrap()
+                .get_block(0, 65, 0),
+            Some(crate::world::Block::Glass)
+        );
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x04);
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x08);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_position().unwrap(), (0, 65, 0));
+        assert_eq!(reader.read_varint().unwrap(), 562);
+        assert_eq!(
+            stack
+                .1
+                .players
+                .get(1)
+                .unwrap()
+                .inventory
+                .get(36)
+                .unwrap()
+                .count,
+            63
+        );
+
+        // Obsidian needs a long hold: too early does nothing...
+        worlds
+            .get_mut(crate::world::DEFAULT_WORLD_NAME)
+            .unwrap()
+            .set_block(0, 64, 0, crate::world::Block::Obsidian);
+        send_dig(&mut first, 2, 0, 64, 0, 1, 22);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 500);
+        assert_eq!(
+            worlds
+                .get(crate::world::DEFAULT_WORLD_NAME)
+                .unwrap()
+                .get_block(0, 64, 0),
+            Some(crate::world::Block::Obsidian)
+        );
+        expect_silence(&mut first);
+        // ...but a full hold breaks it.
+        send_dig(&mut first, 2, 0, 64, 0, 1, 23);
+        settle(&mut stack);
+        stack.1.pump_blocks(&mut stack.0, &mut worlds, 1000);
+        assert_eq!(
+            worlds
+                .get(crate::world::DEFAULT_WORLD_NAME)
+                .unwrap()
+                .get_block(0, 64, 0),
+            Some(crate::world::Block::Air)
+        );
+        let (id, payload) = first.read_packet();
+        assert_eq!(id, 0x04);
+        assert_eq!(Reader::new(&payload).read_varint().unwrap(), 23);
     }
 
     #[test]

@@ -130,14 +130,13 @@ java_port = 25565
 ## Known limitations
 
 Single flat world with a single plains biome, placing uses the held hotbar
-item and only Stone, Dirt and Grass Block exist server-side (other
-items fall back to the held survival item and the client is corrected,
+item and only the 241 known single-state blocks exist server-side (anything else
+falls back to the held survival item and the client is corrected,
 which looks like morphing), creative inventory is client-trusted (any
 stack size up to the max and any known item can be written to any
 slot), full-bright lighting, default skins, no mobs, combat, redstone,
 fluids or plugins. The server runs in offline mode with no encryption or
-compression, chat is broadcast as unsigned system messages, and the
-inbound chat packet ID has not yet been confirmed against a real client.
+compression, and chat is broadcast as unsigned system messages.
 
 ## Project layout
 
